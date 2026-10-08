@@ -9,6 +9,7 @@
 #import "FlutterRTCPeerConnection.h"
 #import "FlutterRTCVideoRenderer.h"
 #import "FlutterRTCFrameCryptor.h"
+#import "FlutterSFrame.h"
 #if TARGET_OS_IPHONE
 #import "FlutterRTCMediaRecorder.h"
 #endif
@@ -1923,6 +1924,10 @@ static void FlutterWebRTCApplyFieldTrials(void) {
         });
       });
     } else {
+      // C182: "sframe*" first — on Apple platforms they all fail closed (FlutterSFrame.m).
+      if ([self handleSFrameMethodCall:call result:result]) {
+        return;
+      }
       if([self handleFrameCryptorMethodCall:call result:result]) {
           return;
       } else {

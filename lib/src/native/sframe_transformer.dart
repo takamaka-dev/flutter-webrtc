@@ -5,8 +5,11 @@
 // (epoch mod 2^16), AAD = SFrame header ‖ clear codec prefix, replay window 128, storm rule, fail closed: a sender
 // with no send KID drops every frame, a receiver drops every frame it cannot authenticate.
 //
-// Android only for now (iOS: ObjC binding owed). Method names are new ("sframe*"): on a binary without them the
-// calls fail instead of silently running another cipher.
+// Android only for now. iOS/macOS: the plugin answers every "sframe*" call with `sframe-unavailable` until the
+// CI-built WebRTC.framework carries the transformer — here that is [SframeUnavailableException], and
+// [SframeKeyStore.available] is false: the app must not start media (fail closed, never a silent pass-through).
+// Method names are new ("sframe*"): on a binary without them the calls fail instead of silently running another
+// cipher.
 import 'dart:async';
 import 'dart:convert';
 
@@ -16,6 +19,29 @@ import 'package:webrtc_interface/webrtc_interface.dart';
 import 'rtc_rtp_receiver_impl.dart';
 import 'rtc_rtp_sender_impl.dart';
 import 'utils.dart';
+
+/// Thrown by every SFrame call on a platform whose WebRTC binary has no SFrame transformer (iOS/macOS today).
+/// A caller that sees it must not publish or render any media of the call.
+class SframeUnavailableException implements Exception {
+  SframeUnavailableException(this.method, this.message);
+
+  final String method;
+  final String? message;
+
+  @override
+  String toString() => 'SframeUnavailableException($method: ${message ?? 'unavailable'})';
+}
+
+Future<T?> _sframeCall<T>(String method, [dynamic param]) async {
+  try {
+    return await WebRTC.invokeMethod<T, dynamic>(method, param);
+  } on PlatformException catch (e) {
+    if (e.code == 'sframe-unavailable') throw SframeUnavailableException(method, e.message);
+    rethrow;
+  } on MissingPluginException {
+    throw SframeUnavailableException(method, 'no native SFrame binding on this platform');
+  }
+}
 
 enum SframeSetKeyResult { changed, unchanged, invalid }
 
@@ -109,8 +135,18 @@ class SframeKeyStore {
   /// Transformer events of every stream of this store.
   Stream<SframeEvent> get events => _events;
 
+  /// True only where the native transformer exists (Android with our AAR). False on iOS/macOS today and on any
+  /// error: callers gate media on it BEFORE any peer connection is created.
+  static Future<bool> available() async {
+    try {
+      return (await WebRTC.invokeMethod<bool, dynamic>('sframeAvailable')) ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   static Future<SframeKeyStore> create({int stormThreshold = 30, bool h264 = false}) async {
-    final r = await WebRTC.invokeMethod<Map<dynamic, dynamic>, dynamic>(
+    final r = await _sframeCall<Map<dynamic, dynamic>>(
         'sframeKeyStoreCreate', <String, dynamic>{'stormThreshold': stormThreshold, 'h264': h264});
     return SframeKeyStore._(r!['keyStoreId'] as String);
   }
@@ -123,36 +159,36 @@ class SframeKeyStore {
   /// Installs the RFC 9605 key + salt of [kid] derived from [baseKey] (= `sender_base_e`, 32 bytes). There is no
   /// separate salt argument: RFC 9605 §4.4.2 derives the salt from the base key and the KID.
   Future<SframeSetKeyResult> setKey(int kid, Uint8List baseKey) async {
-    final r = await WebRTC.invokeMethod<String, dynamic>(
+    final r = await _sframeCall<String>(
         'sframeKeyStoreSetKey', _a({'kid': kid, 'key': Uint8List.fromList(baseKey)}));
     return SframeSetKeyResult.values.byName(r!);
   }
 
   Future<bool> removeKey(int kid) async =>
-      (await WebRTC.invokeMethod<bool, dynamic>('sframeKeyStoreRemoveKey', _a({'kid': kid})))!;
+      (await _sframeCall<bool>('sframeKeyStoreRemoveKey', _a({'kid': kid})))!;
 
   /// Keeps [kid] usable for [retention], then removes it (spec §9.2 receive window).
-  Future<bool> retireKey(int kid, Duration retention) async => (await WebRTC.invokeMethod<bool, dynamic>(
+  Future<bool> retireKey(int kid, Duration retention) async => (await _sframeCall<bool>(
       'sframeKeyStoreRetireKey', _a({'kid': kid, 'retentionMs': retention.inMilliseconds})))!;
 
   /// The KID every sender of this store seals under. False if no key is installed for it.
   Future<bool> setSendKid(int kid) async =>
-      (await WebRTC.invokeMethod<bool, dynamic>('sframeKeyStoreSetSendKid', _a({'kid': kid})))!;
+      (await _sframeCall<bool>('sframeKeyStoreSetSendKid', _a({'kid': kid})))!;
 
-  Future<void> clearSendKid() => WebRTC.invokeMethod<void, dynamic>('sframeKeyStoreClearSendKid', _a());
+  Future<void> clearSendKid() => _sframeCall<void>('sframeKeyStoreClearSendKid', _a());
 
   /// The current send KID, or null.
   Future<int?> sendKid() async {
-    final r = await WebRTC.invokeMethod<int, dynamic>('sframeKeyStoreGetSendKid', _a());
+    final r = await _sframeCall<int>('sframeKeyStoreGetSendKid', _a());
     return r == null || r < 0 ? null : r;
   }
 
   Future<void> setStormThreshold(int n) =>
-      WebRTC.invokeMethod<void, dynamic>('sframeKeyStoreSetStormThreshold', _a({'n': n}));
+      _sframeCall<void>('sframeKeyStoreSetStormThreshold', _a({'n': n}));
 
   /// Counters of every live transformer of this store.
   Future<List<SframeStreamStats>> stats() async {
-    final r = await WebRTC.invokeMethod<String, dynamic>('sframeKeyStoreGetStats', _a());
+    final r = await _sframeCall<String>('sframeKeyStoreGetStats', _a());
     return [for (final m in jsonDecode(r!) as List<dynamic>) SframeStreamStats(m as Map<String, dynamic>)];
   }
 
@@ -160,12 +196,12 @@ class SframeKeyStore {
   /// this store, attached natively inside the call that created it (before Dart sees it). Use this with libraries
   /// that create their own transceivers (livekit_client). [enable] false stops attaching new ones.
   Future<void> autoAttach(bool enable) =>
-      WebRTC.invokeMethod<void, dynamic>('sframeAutoAttach', <String, dynamic>{'keyStoreId': enable ? id : null});
+      _sframeCall<void>('sframeAutoAttach', <String, dynamic>{'keyStoreId': enable ? id : null});
 
   /// Attaches a sealing transformer to [sender] (no-op if one is already attached).
   Future<SframeTransformer> attachToSender(RTCRtpSender sender, SframeMediaKind kind, {String? streamId}) async {
     final s = sender as RTCRtpSenderNative;
-    final r = await WebRTC.invokeMethod<Map<dynamic, dynamic>, dynamic>(
+    final r = await _sframeCall<Map<dynamic, dynamic>>(
         'sframeAttachToSender',
         _a({
           'peerConnectionId': s.peerConnectionId,
@@ -180,7 +216,7 @@ class SframeKeyStore {
   Future<SframeTransformer> attachToReceiver(RTCRtpReceiver receiver, SframeMediaKind kind,
       {String? streamId}) async {
     final rc = receiver as RTCRtpReceiverNative;
-    final r = await WebRTC.invokeMethod<Map<dynamic, dynamic>, dynamic>(
+    final r = await _sframeCall<Map<dynamic, dynamic>>(
         'sframeAttachToReceiver',
         _a({
           'peerConnectionId': rc.peerConnectionId,
@@ -195,7 +231,7 @@ class SframeKeyStore {
   /// in clear — the caller must not publish on it.
   Future<SframeTransformer?> transformerOfSender(RTCRtpSender sender) async {
     final s = sender as RTCRtpSenderNative;
-    final id = await WebRTC.invokeMethod<String, dynamic>('sframeAttachedFor',
+    final id = await _sframeCall<String>('sframeAttachedFor',
         <String, dynamic>{'peerConnectionId': s.peerConnectionId, 'rtpSenderId': s.senderId});
     return id == null ? null : SframeTransformer._(id, this);
   }
@@ -203,7 +239,7 @@ class SframeKeyStore {
   /// The transformer attached to [receiver], or null (then its media must never be rendered).
   Future<SframeTransformer?> transformerOfReceiver(RTCRtpReceiver receiver) async {
     final rc = receiver as RTCRtpReceiverNative;
-    final id = await WebRTC.invokeMethod<String, dynamic>('sframeAttachedFor',
+    final id = await _sframeCall<String>('sframeAttachedFor',
         <String, dynamic>{'peerConnectionId': rc.peerConnectionId, 'rtpReceiverId': rc.receiverId});
     return id == null ? null : SframeTransformer._(id, this);
   }
@@ -211,7 +247,7 @@ class SframeKeyStore {
   /// Releases the store's handles. Transformers already attached stay attached and keep failing closed.
   Future<void> dispose() async {
     if (_disposed) return;
-    await WebRTC.invokeMethod<void, dynamic>('sframeKeyStoreDispose', _a());
+    await _sframeCall<void>('sframeKeyStoreDispose', _a());
     _disposed = true;
   }
 
@@ -220,7 +256,7 @@ class SframeKeyStore {
   /// Seals ONE Opus/VP8-shaped unit natively with the transformer's own code: key of [kid] derived from [baseKey],
   /// explicit [ctr], clear prefix [prefixLen]. For cross-platform vectors only.
   static Future<Uint8List?> vectorSeal(Uint8List baseKey, int kid, int ctr, Uint8List frame, int prefixLen) =>
-      WebRTC.invokeMethod<Uint8List, dynamic>('sframeVectorSeal', <String, dynamic>{
+      _sframeCall<Uint8List>('sframeVectorSeal', <String, dynamic>{
         'key': Uint8List.fromList(baseKey),
         'kid': kid,
         'ctr': ctr,
@@ -230,7 +266,7 @@ class SframeKeyStore {
 
   /// Opens ONE unit natively; null on any failure (bad tag, other KID, bad header).
   static Future<Uint8List?> vectorOpen(Uint8List baseKey, int kid, Uint8List unit, int prefixLen) =>
-      WebRTC.invokeMethod<Uint8List, dynamic>('sframeVectorOpen', <String, dynamic>{
+      _sframeCall<Uint8List>('sframeVectorOpen', <String, dynamic>{
         'key': Uint8List.fromList(baseKey),
         'kid': kid,
         'unit': unit,
@@ -246,7 +282,7 @@ class SframeTransformer {
   final SframeKeyStore store;
 
   Future<SframeStreamStats> stats() async => SframeStreamStats.fromJson(
-      (await WebRTC.invokeMethod<String, dynamic>('sframeCryptorGetStats', <String, dynamic>{'cryptorId': id}))!);
+      (await _sframeCall<String>('sframeCryptorGetStats', <String, dynamic>{'cryptorId': id}))!);
 
   /// Engagement (spec §9.2 [0.2], per subscription): completes when this transformer has handed on
   /// [minPassed] more authenticated frames than at the call (the baseline), or throws on [timeout].

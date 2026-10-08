@@ -11,7 +11,17 @@ int sframeKid(int legIndex, int epoch) {
   return legIndex * 65536 + (epoch % 65536);
 }
 
+class SframeUnavailableException implements Exception {
+  SframeUnavailableException(this.method, this.message);
+  final String method;
+  final String? message;
+  @override
+  String toString() => 'SframeUnavailableException($method: ${message ?? 'unavailable'})';
+}
+
 class SframeKeyStore {
+  static Future<bool> available() async => false;
+
   static Future<SframeKeyStore> create({int stormThreshold = 30, bool h264 = false}) =>
       throw UnsupportedError('SframeKeyStore: native only (web: use the SFrame worker)');
 

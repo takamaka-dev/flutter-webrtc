@@ -172,6 +172,10 @@ public class FlutterSFrame {
 
   private void dispatch(MethodCall call, Result result) {
     switch (call.method) {
+      case "sframeAvailable": {
+        result.success(true); // this AAR carries org.webrtc.SFrame* (the Dart side gates media on it)
+        break;
+      }
       case "sframeKeyStoreCreate": {
         SFrameKeyStore ks = SFrameKeyStore.create();
         Object n = call.argument("stormThreshold");
