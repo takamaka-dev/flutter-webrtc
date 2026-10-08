@@ -506,13 +506,23 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
     sendEvent(params);
   }
 
+  // C182 (F-M2-2): libwebrtc calls onTrack(transceiver) right before onAddTrack(receiver), on the signaling thread.
+  // Keeping it lets onAddTrack avoid PeerConnection.getTransceivers() there: that Java method disposes and rebuilds a
+  // shared cached list without synchronisation, and a concurrent call from the main thread (Dart getTransceivers)
+  // crashed the app on the Sony ("RtpTransceiver has been disposed" → jvm.cc HandleException → SIGABRT).
+  private RtpTransceiver lastOnTrackTransceiver;
+
   @Override
   public void onTrack(RtpTransceiver transceiver) {
+    lastOnTrackTransceiver = transceiver;
   }
 
   @Override
   public void onAddTrack(RtpReceiver receiver, MediaStream[] mediaStreams) {
     Log.d(TAG, "onAddTrack");
+    // C182: attach the SFrame opening transformer (auto-attach mode) before Dart hears of the track.
+    FlutterSFrame sframe = FlutterSFrame.instance;
+    if (sframe != null) sframe.onReceiverAdded(id, receiver);
     // for plan-b
     for (MediaStream stream : mediaStreams) {
       String streamId = stream.getId();
@@ -553,7 +563,12 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
     params.putMap("receiver", rtpReceiverToMap(receiver));
 
     if (this.configuration.sdpSemantics == PeerConnection.SdpSemantics.UNIFIED_PLAN) {
-      List<RtpTransceiver> transceivers = peerConnection.getTransceivers();
+      RtpTransceiver fromOnTrack = lastOnTrackTransceiver;
+      lastOnTrackTransceiver = null;
+      List<RtpTransceiver> transceivers =
+          fromOnTrack != null && fromOnTrack.getReceiver() != null && receiver.id().equals(fromOnTrack.getReceiver().id())
+              ? java.util.Collections.singletonList(fromOnTrack)
+              : peerConnection.getTransceivers();
       for (RtpTransceiver transceiver : transceivers) {
         if (transceiver.getReceiver() != null && receiver.id().equals(transceiver.getReceiver().id())) {
           String transceiverId = transceiver.getMid();
@@ -1041,8 +1056,15 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
     return candidateParams.toMap();
   }
 
+  // C182: attach the SFrame sealing transformer (auto-attach mode) inside the call that created the sender.
+  private void sframeOnSender(RtpSender sender, String kind) {
+    FlutterSFrame sframe = FlutterSFrame.instance;
+    if (sframe != null) sframe.onSenderCreated(id, sender, kind);
+  }
+
   public void addTrack(MediaStreamTrack track, List<String> streamIds, Result result) {
     RtpSender sender = peerConnection.addTrack(track, streamIds);
+    sframeOnSender(sender, null);
     result.success(rtpSenderToMap(sender));
   }
 
@@ -1065,6 +1087,7 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
     } else {
       transceiver = peerConnection.addTransceiver(track);
     }
+    sframeOnSender(transceiver.getSender(), FlutterSFrame.kindOf(transceiver));
     String transceiverId = transceiver.getMid();
     if (null == transceiverId) {
       transceiverId = stateProvider.getNextStreamUUID();
@@ -1080,6 +1103,7 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
     } else {
       transceiver = peerConnection.addTransceiver(stringToMediaType(mediaType));
     }
+    sframeOnSender(transceiver.getSender(), FlutterSFrame.kindOf(transceiver));
     String transceiverId = transceiver.getMid();
     if (null == transceiverId) {
       transceiverId = stateProvider.getNextStreamUUID();

@@ -36,3 +36,6 @@ third_party/downloads/
 third_party/libwebrtc/
 
 android/.gradle
+# C182: local file Maven repository for the fork AAR (tool/install_tkm_aar.sh)
+android/local-maven/
+

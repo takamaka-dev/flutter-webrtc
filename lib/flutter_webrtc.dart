@@ -16,6 +16,9 @@ export 'src/native/rtc_video_view_impl.dart'
     if (dart.library.js_interop) 'src/web/rtc_video_view_impl.dart';
 export 'src/native/utils.dart'
     if (dart.library.js_interop) 'src/web/utils.dart';
+// C182 (Takamaka): the RFC 9605 SFrame transformer of our webrtc-sdk fork (native only).
+export 'src/native/sframe_transformer.dart'
+    if (dart.library.js_interop) 'src/web/sframe_transformer.dart';
 export 'src/native/adapter_type.dart';
 export 'src/native/camera_utils.dart';
 export 'src/native/audio_management.dart';

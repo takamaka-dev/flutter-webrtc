@@ -14,8 +14,13 @@ buildscript {
     }
 }
 
+// C182 (Takamaka): the webrtc-sdk fork with the RFC 9605 SFrame transformer, from a local file repository
+// (tool/install_tkm_aar.sh). Override the directory with -PtkmWebrtcMavenRepo=<dir>.
+def tkmWebrtcRepo = project.findProperty('tkmWebrtcMavenRepo') ?: "${projectDir}/local-maven"
+
 rootProject.allprojects {
     repositories {
+        maven { url tkmWebrtcRepo }
         google()
         mavenCentral()
         maven { url 'https://jitpack.io' }
@@ -75,7 +80,8 @@ if (kotlinExt?.hasProperty('compilerOptions')) {
 }
 
 dependencies {
-    implementation 'io.github.webrtc-sdk:android:150.7871.01'
+    // C182: our fork build (stock: io.github.webrtc-sdk:android:150.7871.01)
+    implementation 'io.github.webrtc-sdk:android:150.7871.03-tkm.4'
     implementation 'com.github.davidliu:audioswitch:039a35aefab7747c557242fa216c9ea11743b604'
     implementation 'androidx.annotation:annotation:1.1.0'
     testImplementation 'junit:junit:4.13.2'

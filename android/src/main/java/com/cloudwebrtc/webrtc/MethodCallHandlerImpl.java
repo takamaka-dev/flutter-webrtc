@@ -135,6 +135,7 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
   private boolean microphoneMuted = false;
 
   private FlutterRTCFrameCryptor frameCryptor;
+  private FlutterSFrame sframe;
 
   private FlutterDataPacketCryptor dataPacketCryptor;
 
@@ -270,6 +271,7 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     cameraUtils = new CameraUtils(getUserMediaImpl, activity);
 
     frameCryptor = new FlutterRTCFrameCryptor(this);
+    sframe = new FlutterSFrame(this);
 
     dataPacketCryptor = new FlutterDataPacketCryptor(frameCryptor);
 
@@ -1248,7 +1250,9 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
         break;
       }
       default:
-        if(frameCryptor.handleMethodCall(call, result)) {
+        if(sframe.handleMethodCall(call, result)) {
+          break;
+        } else if(frameCryptor.handleMethodCall(call, result)) {
           break;
         } else if(dataPacketCryptor.handleMethodCall(call, result)) {
           break;
