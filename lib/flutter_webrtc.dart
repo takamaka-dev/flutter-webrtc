@@ -19,6 +19,9 @@ export 'src/native/utils.dart'
 // C182 (Takamaka): the RFC 9605 SFrame transformer of our webrtc-sdk fork (native only).
 export 'src/native/sframe_transformer.dart'
     if (dart.library.js_interop) 'src/web/sframe_transformer.dart';
+// C182 (Takamaka): remote-SDP hook + the Opus answer rewrite of spec §9.1 (pure Dart, every platform).
+export 'src/remote_sdp_hook.dart';
+export 'src/opus_sdp.dart';
 export 'src/native/adapter_type.dart';
 export 'src/native/camera_utils.dart';
 export 'src/native/audio_management.dart';

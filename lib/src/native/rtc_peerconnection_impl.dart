@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 
 import 'package:webrtc_interface/webrtc_interface.dart';
 
+import '../remote_sdp_hook.dart';
 import 'media_stream_impl.dart';
 import 'media_stream_track_impl.dart';
 import 'rtc_data_channel_impl.dart';
@@ -418,6 +419,8 @@ class RTCPeerConnectionNative extends RTCPeerConnection {
 
   @override
   Future<void> setRemoteDescription(RTCSessionDescription description) async {
+    // C182: the process-wide remote-SDP hook (Opus send parameters of spec §9.1).
+    description = RemoteSdpHook.apply(description);
     try {
       await WebRTC.invokeMethod('setRemoteDescription', <String, dynamic>{
         'peerConnectionId': _peerConnectionId,
