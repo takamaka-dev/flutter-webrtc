@@ -1723,6 +1723,12 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     return messenger;
   }
 
+  @Override
+  @Nullable
+  public org.webrtc.ExternalAudioProcessingFactory getAudioProcessingFactory() {
+    return audioProcessingController == null ? null : audioProcessingController.externalAudioProcessingFactory;
+  }
+
   MediaStream getStreamForId(String id, String peerConnectionId) {
     MediaStream stream = null;
     if (peerConnectionId.length() > 0) {

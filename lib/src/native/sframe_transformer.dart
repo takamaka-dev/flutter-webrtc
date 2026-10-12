@@ -124,6 +124,20 @@ class SframeStreamStats {
       '${dropSamples.isEmpty ? '' : ' samples $dropSamples'}';
 }
 
+/// C-25 (2026-10-12): the Android capture tuning of our fork — WebRTC's adaptive digital AGC (AGC2 + limiter) as the
+/// ONE software AGC stage, and the API 29+ "microphone towards the user" hint. Call once per call BEFORE the first
+/// audio track exists (the hint applies at AudioRecord creation). No-op on iOS/macOS (VPIO already does AGC).
+class SframeAudioTuning {
+  SframeAudioTuning._();
+
+  /// Returns the live AudioProcessing config string on Android (for logs), '' elsewhere. Throws
+  /// [SframeUnavailableException] on a binary without the tuning (AAR < tkm.7).
+  static Future<String> apply({required bool adaptiveDigitalAgc, required bool micTowardsUser}) async =>
+      (await _sframeCall<String>('sframeAudioTuning',
+          <String, dynamic>{'adaptiveDigitalAgc': adaptiveDigitalAgc, 'micTowardsUser': micTowardsUser})) ??
+      '';
+}
+
 /// KID of spec §9.2: `leg_index·2^16 + (epoch mod 2^16)`.
 int sframeKid(int legIndex, int epoch) {
   if (legIndex < 1 || legIndex > 0xffff) throw ArgumentError('leg_index 1..65535');

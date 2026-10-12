@@ -223,6 +223,21 @@ public class FlutterSFrame {
         store(call).keyStore.setHoldTime(asLong(call.argument("holdMs")));
         result.success(null);
         return;
+      case "sframeAudioTuning": { // C-25 (AAR >= 150.7871.03-tkm.7)
+        Boolean agc2 = call.argument("adaptiveDigitalAgc");
+        Boolean mic = call.argument("micTowardsUser");
+        org.webrtc.audio.WebRtcAudioRecord.setPreferMicrophoneTowardsUser(mic != null && mic);
+        org.webrtc.ExternalAudioProcessingFactory f = stateProvider.getAudioProcessingFactory();
+        if (f == null) {
+          result.error("sframe-unavailable", "no audio processing factory (initialize first)", null);
+          return;
+        }
+        f.setAdaptiveDigitalAgc(agc2 != null && agc2);
+        String cfg = f.getAudioProcessingConfig();
+        Log.i(TAG, "C-25 audio tuning: agc2=" + agc2 + " micTowardsUser=" + mic + " apm=" + cfg);
+        result.success(cfg);
+        return;
+      }
       case "sframeKeyStoreGetStats":
         result.success(store(call).keyStore.getStatsJson());
         return;

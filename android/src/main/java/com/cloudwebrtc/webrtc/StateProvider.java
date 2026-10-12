@@ -42,4 +42,8 @@ public interface StateProvider {
   Context getApplicationContext();
 
   BinaryMessenger getMessenger();
+
+  /** C-25: the fork's external audio processing factory of the live peer connection factory, or null before initialize. */
+  @Nullable
+  org.webrtc.ExternalAudioProcessingFactory getAudioProcessingFactory();
 }

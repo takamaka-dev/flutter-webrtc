@@ -297,6 +297,8 @@ static NSMutableData* TkmBytes(id o) {
   } else if ([method isEqualToString:@"sframeKeyStoreSetStormThreshold"]) {
     [store().keyStore setStormThreshold:(int)TkmLong(args[@"n"])];
     result(nil);
+  } else if ([method isEqualToString:@"sframeAudioTuning"]) {
+    result(@"");  // C-25 is Android-only: iOS VPIO already does multi-mic + AEC/NS/AGC
   } else if ([method isEqualToString:@"sframeKeyStoreSetHoldTime"]) {
     // C-24: -setHoldTimeMs: exists from WebRTC-SDK tkm.6; invoked by selector so this file still builds against
     // tkm.5 (then the call fails loudly instead of silently doing nothing).
