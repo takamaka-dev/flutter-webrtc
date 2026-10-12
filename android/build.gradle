@@ -17,16 +17,16 @@ buildscript {
 // C182 (Takamaka): the webrtc-sdk fork with the RFC 9605 SFrame transformer, from a local file repository
 // (tool/install_tkm_aar.sh). Override the directory with -PtkmWebrtcMavenRepo=<dir>.
 def tkmWebrtcRepo = project.findProperty('tkmWebrtcMavenRepo') ?: "${projectDir}/local-maven"
-def tkmWebrtcVersion = '150.7871.03-tkm.4'
+def tkmWebrtcVersion = '150.7871.03-tkm.6' // C-24 hold (sframe_transformer: held frames)
 
 // C182 B-0 (2026-10-12): when the fork AAR is not in that repository, fetch it from the
 // takamaka-dev/webrtc-build release by TAG and refuse it unless its sha256 is the pinned one —
 // so another PC builds without the 23 GB WebRTC tree. Override with -PtkmWebrtcAarUrl=… and
 // -PtkmWebrtcAarSha256=… (both must change together); -PtkmWebrtcAarOffline=true skips the fetch.
 def tkmWebrtcAarUrl = project.findProperty('tkmWebrtcAarUrl') ?:
-    'https://github.com/takamaka-dev/webrtc-build/releases/download/android-c182-sframe.1/libwebrtc-android-c182-sframe.1.aar'
+    'https://github.com/takamaka-dev/webrtc-build/releases/download/android-c182-sframe.2/libwebrtc-android-c182-sframe.2.aar'
 def tkmWebrtcAarSha256 = project.findProperty('tkmWebrtcAarSha256') ?:
-    '3cc770ec031364b0e9d45195d53a1855ea5c4ff026119971c654ccd79a1a3c54'
+    '5df4bc9907691afe85e402d123e6aa14cb1b3dd40992b36397b2ef3dc508b7bb'
 def tkmAarDir = file("${tkmWebrtcRepo}/io/github/webrtc-sdk/android/${tkmWebrtcVersion}")
 def tkmAar = new File(tkmAarDir, "android-${tkmWebrtcVersion}.aar")
 if (!tkmAar.exists() && !Boolean.parseBoolean("${project.findProperty('tkmWebrtcAarOffline') ?: 'false'}")) {

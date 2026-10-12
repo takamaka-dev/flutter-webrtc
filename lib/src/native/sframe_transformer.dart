@@ -47,16 +47,17 @@ enum SframeSetKeyResult { changed, unchanged, invalid }
 
 enum SframeMediaKind { audio, video }
 
-/// One transformer event (spec §9.2 [0.2] engagement + storm rule).
+/// One transformer event (spec §9.2 [0.2] engagement + storm rule; [0.3] C-24 `held` / `released`).
 class SframeEvent {
-  SframeEvent(this.type, this.streamId, this.reason, this.kid, this.consecutive);
+  SframeEvent(this.type, this.streamId, this.reason, this.kid, this.consecutive, {this.count = 0});
 
   factory SframeEvent.fromMap(Map<dynamic, dynamic> m) => SframeEvent(
       m['event'] as String,
       m['streamId'] as String? ?? '',
       m['reason'] as String? ?? '',
       (m['kid'] as num?)?.toInt() ?? -1,
-      (m['consecutive'] as num?)?.toInt() ?? 0);
+      (m['consecutive'] as num?)?.toInt() ?? 0,
+      count: (m['count'] as num?)?.toInt() ?? 0);
 
   /// `engaged`, `first-pass`, `dropping`, `storm`, `recovered`, `resumed`, `key-expired`, `key-evicted`.
   final String type;
@@ -68,6 +69,9 @@ class SframeEvent {
   /// -1 when none.
   final int kid;
   final int consecutive;
+
+  /// `released`: the held frames opened and delivered when the key of [kid] arrived (C-24); else 0.
+  final int count;
 
   @override
   String toString() =>
@@ -100,6 +104,12 @@ class SframeStreamStats {
   int get consecutive => raw['consecutive'] as int;
   bool get storm => raw['storm'] as bool;
   int get storms => raw['storms'] as int;
+
+  /// C-24 (receive video): frames held for the key of a known leg's next epoch instead of dropped; of which
+  /// released when it came; currently held. 0 on a binary without the hold (AAR < tkm.6).
+  int get held => (raw['held'] as num?)?.toInt() ?? 0;
+  int get heldReleased => (raw['heldReleased'] as num?)?.toInt() ?? 0;
+  int get heldNow => (raw['heldNow'] as num?)?.toInt() ?? 0;
   int? get lastKid => raw['lastKid'] as int?;
   int? get firstFrameAtMs => raw['firstFrameAtMs'] as int?;
   int? get firstPassAtMs => raw['firstPassAtMs'] as int?;
@@ -110,7 +120,8 @@ class SframeStreamStats {
   @override
   String toString() =>
       '$role/$kind ${streamId.length > 24 ? streamId.substring(0, 24) : streamId}: frames $frames passed $passed '
-      'dropped $dropped storms $storms${storm ? ' STORM' : ''}${dropSamples.isEmpty ? '' : ' samples $dropSamples'}';
+      'dropped $dropped storms $storms${storm ? ' STORM' : ''}${held == 0 ? '' : ' held $held/$heldReleased (now $heldNow)'}'
+      '${dropSamples.isEmpty ? '' : ' samples $dropSamples'}';
 }
 
 /// KID of spec §9.2: `leg_index·2^16 + (epoch mod 2^16)`.
@@ -185,6 +196,12 @@ class SframeKeyStore {
 
   Future<void> setStormThreshold(int n) =>
       _sframeCall<void>('sframeKeyStoreSetStormThreshold', _a({'n': n}));
+
+  /// C-24 (spec §9.2 [0.3]): how long a receive VIDEO stream holds frames of a known leg's next epoch(s) while their
+  /// key is missing (the native default is 10 s = the `retention` default; pass the call's `retention`).
+  /// [Duration.zero] turns holding off. Throws [SframeUnavailableException] on a binary without the hold.
+  Future<void> setHoldTime(Duration hold) =>
+      _sframeCall<void>('sframeKeyStoreSetHoldTime', _a({'holdMs': hold.inMilliseconds}));
 
   /// Counters of every live transformer of this store.
   Future<List<SframeStreamStats>> stats() async {

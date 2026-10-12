@@ -70,13 +70,14 @@ public class FlutterSFrame {
     }
 
     @Override
-    public void onSFrameEvent(String type, String streamId, String reason, long kid, long consecutive) {
+    public void onSFrameEvent(String type, String streamId, String reason, long kid, long consecutive, long count) {
       Map<String, Object> e = new HashMap<>();
       e.put("event", type);
       e.put("streamId", streamId);
       e.put("reason", reason);
       e.put("kid", kid);
       e.put("consecutive", consecutive);
+      e.put("count", count); // C-24 `released`: frames delivered when the key came
       synchronized (queue) {
         if (sink != null) {
           sink.success(e);
@@ -216,6 +217,10 @@ public class FlutterSFrame {
         return;
       case "sframeKeyStoreSetStormThreshold":
         store(call).keyStore.setStormThreshold((int) asLong(call.argument("n")));
+        result.success(null);
+        return;
+      case "sframeKeyStoreSetHoldTime": // C-24 (AAR >= 150.7871.03-tkm.6)
+        store(call).keyStore.setHoldTime(asLong(call.argument("holdMs")));
         result.success(null);
         return;
       case "sframeKeyStoreGetStats":

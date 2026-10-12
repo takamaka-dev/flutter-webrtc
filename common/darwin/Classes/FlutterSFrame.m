@@ -63,18 +63,32 @@
 }
 
 // On a WebRTC media thread: only queue/post, never block.
+// The tkm.5 framework's delegate selector (no `count`); kept so the binding builds and receives events against
+// either framework. tkm.6+ calls the selector below.
 - (void)sframeKeyStore:(RTCSFrameKeyStore*)keyStore
       didEventWithType:(NSString*)type
               streamId:(NSString*)streamId
                 reason:(NSString*)reason
                    kid:(int64_t)kid
            consecutive:(int64_t)consecutive {
+  [self sframeKeyStore:keyStore didEventWithType:type streamId:streamId reason:reason kid:kid
+           consecutive:consecutive count:0];
+}
+
+- (void)sframeKeyStore:(RTCSFrameKeyStore*)keyStore
+      didEventWithType:(NSString*)type
+              streamId:(NSString*)streamId
+                reason:(NSString*)reason
+                   kid:(int64_t)kid
+           consecutive:(int64_t)consecutive
+                 count:(int64_t)count {
   NSDictionary* e = @{
     @"event" : type ?: @"",
     @"streamId" : streamId ?: @"",
     @"reason" : reason ?: @"",
     @"kid" : @(kid),
     @"consecutive" : @(consecutive),
+    @"count" : @(count), // C-24 `released`
   };
   FlutterEventSink sink;
   @synchronized(self) {
@@ -282,6 +296,24 @@ static NSMutableData* TkmBytes(id o) {
     result(@([store().keyStore sendKid]));
   } else if ([method isEqualToString:@"sframeKeyStoreSetStormThreshold"]) {
     [store().keyStore setStormThreshold:(int)TkmLong(args[@"n"])];
+    result(nil);
+  } else if ([method isEqualToString:@"sframeKeyStoreSetHoldTime"]) {
+    // C-24: -setHoldTimeMs: exists from WebRTC-SDK tkm.6; invoked by selector so this file still builds against
+    // tkm.5 (then the call fails loudly instead of silently doing nothing).
+    RTCSFrameKeyStore* ks = store().keyStore;
+    SEL sel = NSSelectorFromString(@"setHoldTimeMs:");
+    if (![ks respondsToSelector:sel]) {
+      result([FlutterError errorWithCode:kSFrameUnavailable
+                                 message:@"setHoldTime needs the WebRTC-SDK tkm.6 framework"
+                                 details:nil]);
+      return nil;
+    }
+    int64_t ms = TkmLong(args[@"holdMs"]);
+    NSInvocation* inv = [NSInvocation invocationWithMethodSignature:[ks methodSignatureForSelector:sel]];
+    [inv setSelector:sel];
+    [inv setTarget:ks];
+    [inv setArgument:&ms atIndex:2];
+    [inv invoke];
     result(nil);
   } else if ([method isEqualToString:@"sframeKeyStoreGetStats"]) {
     result([store().keyStore statsJson]);
