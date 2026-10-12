@@ -1,4 +1,5 @@
 #import "FlutterRTCPeerConnection.h"
+#import "FlutterSFrame.h"
 #import <objc/runtime.h>
 #import "AudioUtils.h"
 #import "FlutterRTCDataChannel.h"
@@ -630,6 +631,8 @@
 - (void)peerConnection:(RTCPeerConnection*)peerConnection
         didAddReceiver:(RTCRtpReceiver*)rtpReceiver
                streams:(NSArray<RTCMediaStream*>*)mediaStreams {
+  // C182: attach the SFrame opening transformer (auto-attach mode) before Dart hears of the track.
+  [self sframeOnReceiverAdded:rtpReceiver peerConnectionId:peerConnection.flutterId];
   // For unified-plan
   NSMutableArray* streams = [NSMutableArray array];
   for (RTCMediaStream* stream in mediaStreams) {
