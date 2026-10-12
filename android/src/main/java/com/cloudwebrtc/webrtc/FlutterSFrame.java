@@ -226,7 +226,7 @@ public class FlutterSFrame {
       case "sframeAudioTuning": { // C-25 (AAR >= 150.7871.03-tkm.7)
         Boolean agc2 = call.argument("adaptiveDigitalAgc");
         Boolean mic = call.argument("micTowardsUser");
-        org.webrtc.audio.WebRtcAudioRecord.setPreferMicrophoneTowardsUser(mic != null && mic);
+        org.webrtc.audio.JavaAudioDeviceModule.setPreferMicrophoneTowardsUser(mic != null && mic);
         org.webrtc.ExternalAudioProcessingFactory f = stateProvider.getAudioProcessingFactory();
         if (f == null) {
           result.error("sframe-unavailable", "no audio processing factory (initialize first)", null);

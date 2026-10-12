@@ -26,7 +26,7 @@ def tkmWebrtcVersion = '150.7871.03-tkm.7' // C-24 hold + C-25 AGC2 / mic-direct
 def tkmWebrtcAarUrl = project.findProperty('tkmWebrtcAarUrl') ?:
     'https://github.com/takamaka-dev/webrtc-build/releases/download/android-c182-sframe.2/libwebrtc-android-c182-sframe.2.aar'
 def tkmWebrtcAarSha256 = project.findProperty('tkmWebrtcAarSha256') ?:
-    '6d775474a99bdf65c6d0198c6449177a69a0eb6adf8687cbc6285b2a6c24c4cb'
+    '1686eca9f36425b2b9e6e673fe15c5c9d777a269a9a16a569051918130126c0a'
 def tkmAarDir = file("${tkmWebrtcRepo}/io/github/webrtc-sdk/android/${tkmWebrtcVersion}")
 def tkmAar = new File(tkmAarDir, "android-${tkmWebrtcVersion}.aar")
 if (!tkmAar.exists() && !Boolean.parseBoolean("${project.findProperty('tkmWebrtcAarOffline') ?: 'false'}")) {
