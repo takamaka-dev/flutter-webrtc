@@ -17,6 +17,47 @@ buildscript {
 // C182 (Takamaka): the webrtc-sdk fork with the RFC 9605 SFrame transformer, from a local file repository
 // (tool/install_tkm_aar.sh). Override the directory with -PtkmWebrtcMavenRepo=<dir>.
 def tkmWebrtcRepo = project.findProperty('tkmWebrtcMavenRepo') ?: "${projectDir}/local-maven"
+def tkmWebrtcVersion = '150.7871.03-tkm.4'
+
+// C182 B-0 (2026-10-12): when the fork AAR is not in that repository, fetch it from the
+// takamaka-dev/webrtc-build release by TAG and refuse it unless its sha256 is the pinned one —
+// so another PC builds without the 23 GB WebRTC tree. Override with -PtkmWebrtcAarUrl=… and
+// -PtkmWebrtcAarSha256=… (both must change together); -PtkmWebrtcAarOffline=true skips the fetch.
+def tkmWebrtcAarUrl = project.findProperty('tkmWebrtcAarUrl') ?:
+    'https://github.com/takamaka-dev/webrtc-build/releases/download/android-c182-sframe.1/libwebrtc-android-c182-sframe.1.aar'
+def tkmWebrtcAarSha256 = project.findProperty('tkmWebrtcAarSha256') ?:
+    '3cc770ec031364b0e9d45195d53a1855ea5c4ff026119971c654ccd79a1a3c54'
+def tkmAarDir = file("${tkmWebrtcRepo}/io/github/webrtc-sdk/android/${tkmWebrtcVersion}")
+def tkmAar = new File(tkmAarDir, "android-${tkmWebrtcVersion}.aar")
+if (!tkmAar.exists() && !Boolean.parseBoolean("${project.findProperty('tkmWebrtcAarOffline') ?: 'false'}")) {
+    tkmAarDir.mkdirs()
+    def part = new File(tkmAarDir, "android-${tkmWebrtcVersion}.aar.part")
+    logger.lifecycle("C182: fork AAR ${tkmWebrtcVersion} not in ${tkmWebrtcRepo} - fetching ${tkmWebrtcAarUrl}")
+    try {
+        new URL(tkmWebrtcAarUrl).withInputStream { i -> part.withOutputStream { o -> o << i } }
+    } catch (Exception e) {
+        part.delete()
+        throw new GradleException("C182: could not fetch the fork AAR (${e.message}); put it in ${tkmWebrtcRepo} with tool/install_tkm_aar.sh or pass -PtkmWebrtcAarOffline=true", e)
+    }
+    def digest = java.security.MessageDigest.getInstance('SHA-256')
+    part.eachByte(1 << 16) { buf, n -> digest.update(buf, 0, n) }
+    def got = digest.digest().encodeHex().toString()
+    if (got != tkmWebrtcAarSha256) {
+        part.delete()
+        throw new GradleException("C182: fork AAR sha256 mismatch (got ${got}, pinned ${tkmWebrtcAarSha256}) - refusing it")
+    }
+    if (!part.renameTo(tkmAar)) throw new GradleException("C182: could not place ${tkmAar}")
+    new File(tkmAarDir, "android-${tkmWebrtcVersion}.pom").text = """<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>io.github.webrtc-sdk</groupId>
+  <artifactId>android</artifactId>
+  <version>${tkmWebrtcVersion}</version>
+  <packaging>aar</packaging>
+</project>
+"""
+    logger.lifecycle("C182: fork AAR verified (sha256 ${got.take(12)}...) -> ${tkmAar}")
+}
 
 rootProject.allprojects {
     repositories {
@@ -81,7 +122,7 @@ if (kotlinExt?.hasProperty('compilerOptions')) {
 
 dependencies {
     // C182: our fork build (stock: io.github.webrtc-sdk:android:150.7871.01)
-    implementation 'io.github.webrtc-sdk:android:150.7871.03-tkm.4'
+    implementation "io.github.webrtc-sdk:android:${tkmWebrtcVersion}"
     implementation 'com.github.davidliu:audioswitch:039a35aefab7747c557242fa216c9ea11743b604'
     implementation 'androidx.annotation:annotation:1.1.0'
     testImplementation 'junit:junit:4.13.2'
