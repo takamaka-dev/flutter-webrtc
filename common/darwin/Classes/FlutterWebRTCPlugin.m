@@ -1394,6 +1394,8 @@ static void FlutterWebRTCApplyFieldTrials(void) {
                 details:nil]);
       return;
     }
+    // C182: attach the SFrame sealing transformer (auto-attach mode) inside the call that created the sender.
+    [self sframeOnSenderCreated:sender peerConnectionId:peerConnectionId kind:track.kind];
 
     result([self rtpSenderToMap:sender]);
   } else if ([@"removeTrack" isEqualToString:call.method]) {
@@ -1468,6 +1470,10 @@ static void FlutterWebRTCApplyFieldTrials(void) {
                                  details:nil]);
       return;
     }
+    // C182: attach the SFrame sealing transformer (auto-attach mode) before Dart sees the transceiver.
+    [self sframeOnSenderCreated:transceiver.sender
+               peerConnectionId:peerConnectionId
+                           kind:(transceiver.mediaType == RTCRtpMediaTypeAudio ? @"audio" : @"video")];
 
     result([self transceiverToMap:transceiver]);
   } else if ([@"rtpTransceiverSetDirection" isEqualToString:call.method]) {
@@ -1924,7 +1930,7 @@ static void FlutterWebRTCApplyFieldTrials(void) {
         });
       });
     } else {
-      // C182: "sframe*" first — on Apple platforms they all fail closed (FlutterSFrame.m).
+      // C182: "sframe*" first (FlutterSFrame.m: the real binding, or fail closed on a stock framework).
       if ([self handleSFrameMethodCall:call result:result]) {
         return;
       }
