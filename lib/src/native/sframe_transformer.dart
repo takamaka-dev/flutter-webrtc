@@ -132,9 +132,15 @@ class SframeAudioTuning {
 
   /// Returns the live AudioProcessing config string on Android (for logs), '' elsewhere. Throws
   /// [SframeUnavailableException] on a binary without the tuning (AAR < tkm.7).
-  static Future<String> apply({required bool adaptiveDigitalAgc, required bool micTowardsUser}) async =>
-      (await _sframeCall<String>('sframeAudioTuning',
-          <String, dynamic>{'adaptiveDigitalAgc': adaptiveDigitalAgc, 'micTowardsUser': micTowardsUser})) ??
+  /// [levelMeter] (2009b, 2026-10-13): one logcat line per 10 s with the peak / RMS of the APM's capture OUTPUT
+  /// (`tkm C-25: [APM out] …`) — the level the far side receives, after AGC2; the raw `[REC] level` line is before it.
+  static Future<String> apply(
+          {required bool adaptiveDigitalAgc, required bool micTowardsUser, bool levelMeter = false}) async =>
+      (await _sframeCall<String>('sframeAudioTuning', <String, dynamic>{
+            'adaptiveDigitalAgc': adaptiveDigitalAgc,
+            'micTowardsUser': micTowardsUser,
+            'levelMeter': levelMeter,
+          })) ??
       '';
 }
 

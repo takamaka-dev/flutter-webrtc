@@ -1729,6 +1729,12 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     return audioProcessingController == null ? null : audioProcessingController.externalAudioProcessingFactory;
   }
 
+  @Override
+  @Nullable
+  public com.cloudwebrtc.webrtc.audio.AudioProcessingAdapter getCapturePostProcessing() {
+    return audioProcessingController == null ? null : audioProcessingController.capturePostProcessing;
+  }
+
   MediaStream getStreamForId(String id, String peerConnectionId) {
     MediaStream stream = null;
     if (peerConnectionId.length() > 0) {

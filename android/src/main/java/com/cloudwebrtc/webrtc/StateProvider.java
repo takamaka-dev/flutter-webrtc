@@ -46,4 +46,8 @@ public interface StateProvider {
   /** C-25: the fork's external audio processing factory of the live peer connection factory, or null before initialize. */
   @Nullable
   org.webrtc.ExternalAudioProcessingFactory getAudioProcessingFactory();
+
+  /** C-25: the plugin's capture post-processing adapter (runs after the APM's gain controllers), or null before initialize. */
+  @Nullable
+  com.cloudwebrtc.webrtc.audio.AudioProcessingAdapter getCapturePostProcessing();
 }

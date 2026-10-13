@@ -233,8 +233,13 @@ public class FlutterSFrame {
           return;
         }
         f.setAdaptiveDigitalAgc(agc2 != null && agc2);
+        Boolean meter = call.argument("levelMeter"); // 2009b: the post-APM capture level, one line per 10 s
+        com.cloudwebrtc.webrtc.audio.AudioProcessingAdapter capturePost = stateProvider.getCapturePostProcessing();
+        if (capturePost != null) {
+          com.cloudwebrtc.webrtc.audio.CaptureLevelMeter.install(capturePost, meter != null && meter);
+        }
         String cfg = f.getAudioProcessingConfig();
-        Log.i(TAG, "C-25 audio tuning: agc2=" + agc2 + " micTowardsUser=" + mic + " apm=" + cfg);
+        Log.i(TAG, "C-25 audio tuning: agc2=" + agc2 + " micTowardsUser=" + mic + " levelMeter=" + meter + " apm=" + cfg);
         result.success(cfg);
         return;
       }
