@@ -11,6 +11,10 @@
 #define TKM_HAS_SFRAME 0
 #endif
 
+// Error code shared by both build flavours: the fail-closed stub below and the C-24 hold-time path
+// (which needs the WebRTC-SDK tkm.6 framework even in a TKM_HAS_SFRAME build).
+static NSString* const kSFrameUnavailable = @"sframe-unavailable";
+
 #if TKM_HAS_SFRAME
 
 #pragma mark - Store (one per key store: delegate + event channel)
@@ -308,7 +312,7 @@ static NSMutableData* TkmBytes(id o) {
       result([FlutterError errorWithCode:kSFrameUnavailable
                                  message:@"setHoldTime needs the WebRTC-SDK tkm.6 framework"
                                  details:nil]);
-      return nil;
+      return;
     }
     int64_t ms = TkmLong(args[@"holdMs"]);
     NSInvocation* inv = [NSInvocation invocationWithMethodSignature:[ks methodSignatureForSelector:sel]];
@@ -438,8 +442,6 @@ static NSMutableData* TkmBytes(id o) {
 }
 
 #else  // !TKM_HAS_SFRAME — FAIL CLOSED
-
-static NSString* const kSFrameUnavailable = @"sframe-unavailable";
 
 - (void)sframeOnSenderCreated:(RTCRtpSender*)sender peerConnectionId:(NSString*)peerConnectionId kind:(NSString*)kind {
 }
