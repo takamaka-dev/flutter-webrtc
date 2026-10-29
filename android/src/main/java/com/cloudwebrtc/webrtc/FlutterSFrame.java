@@ -7,6 +7,12 @@
 // this plugin (addTrack / addTransceiver) gets a sealing transformer inside the same native call that created it, and
 // EVERY RtpReceiver an opening transformer in onAddTrack, before the event reaches Dart. So a library that creates
 // its own transceivers (livekit_client) cannot send a frame before the transformer is attached.
+//
+// S-8 (rulings Q5/Q6): the first selection ARMS the plugin for the life of the process. From then on "no store
+// selected" (after autoAttach(false), or after the selected store was disposed) attaches a key-less SENTINEL store
+// instead of nothing: its senders drop every frame (no send KID), its receivers every frame (unbound / no key). So a
+// sender or receiver created between two calls, or by a late renegotiation after the call ended, is never left
+// without a transformer (= media in clear). While one store is selected, selecting another is refused.
 package com.cloudwebrtc.webrtc;
 
 import android.util.Log;
@@ -48,9 +54,13 @@ public class FlutterSFrame {
     volatile EventChannel.EventSink sink;
     final List<Map<String, Object>> queue = new ArrayList<>();
 
-    Store(String id, SFrameKeyStore keyStore, BinaryMessenger messenger) {
+    Store(String id, SFrameKeyStore keyStore, @Nullable BinaryMessenger messenger) {
       this.id = id;
       this.keyStore = keyStore;
+      if (messenger == null) { // the S-8 sentinel: no Dart listener, no events
+        this.channel = null;
+        return;
+      }
       this.channel = new EventChannel(messenger, "FlutterWebRTC/sframeEvents/" + id);
       this.channel.setStreamHandler(new EventChannel.StreamHandler() {
         @Override
@@ -111,7 +121,79 @@ public class FlutterSFrame {
   private final Map<String, Attached> cryptors = new ConcurrentHashMap<>();
   /** "pc/send/<senderId>" or "pc/recv/<receiverId>" → attached cryptor id. */
   private final Map<String, String> byEndpoint = new ConcurrentHashMap<>();
-  @Nullable private volatile String autoAttachStoreId;
+  private final AutoAttach autoAttach = new AutoAttach();
+
+  /** S-8: the key-less store auto-attached while armed and nothing is selected. Never in {@link #stores}. */
+  @Nullable private static Store sentinel;
+  static final String SENTINEL_ID = "tkm-sframe-sentinel";
+
+  /**
+   * S-8 (rulings Q5/Q6): the auto-attach selection of one plugin instance + the process-wide "armed" latch. Pure
+   * state, no JNI (unit-tested in FlutterSFrameAutoAttachTest).
+   */
+  static final class AutoAttach {
+    /** Q5: set at the first selection of a store, never cleared for the life of the process. */
+    private static volatile boolean armed;
+    @Nullable private volatile String selected;
+
+    /** Selects {@code id} (null = none). Q6: refuses a second store while another live one is selected. */
+    synchronized void select(@Nullable String id, Map<String, ?> live) {
+      if (id != null) {
+        final String current = selected;
+        if (current != null && !current.equals(id) && live.containsKey(current)) {
+          throw new IllegalStateException("another key store is selected for auto-attach (S-8: one call plane)");
+        }
+        armed = true;
+      }
+      selected = id;
+    }
+
+    /** The store {@code id} was disposed: if it was selected, nothing is (the sentinel takes over when armed). */
+    synchronized void forget(String id) {
+      if (id.equals(selected)) selected = null;
+    }
+
+    @Nullable
+    String selected() {
+      return selected;
+    }
+
+    /** The store id a new sender/receiver gets: the selected live store, else the sentinel when armed, else none. */
+    @Nullable
+    String target(Map<String, ?> live) {
+      final String id = selected;
+      if (id != null && live.containsKey(id)) return id;
+      return armed ? SENTINEL_ID : null;
+    }
+
+    static boolean armed() {
+      return armed;
+    }
+
+    /** Tests only: a fresh process. */
+    static void disarmForTest() {
+      armed = false;
+    }
+  }
+
+  private static synchronized Store sentinel() {
+    if (sentinel == null) {
+      SFrameKeyStore ks = SFrameKeyStore.create(); // never a key, never a send KID: everything drops
+      ks.setRequireLegBinding(true); // and its receivers are never bound: 'unbound' (S-7)
+      sentinel = new Store(SENTINEL_ID, ks, null);
+    }
+    return sentinel;
+  }
+
+  /** The store a new sender/receiver gets: the selected one, else (armed) the sentinel, else none (never armed). */
+  @Nullable
+  private Store autoAttachStore() {
+    final String id = autoAttach.target(stores);
+    if (id == null) return null;
+    if (SENTINEL_ID.equals(id)) return sentinel();
+    final Store s = stores.get(id);
+    return s != null ? s : sentinel(); // disposed in between: armed by construction (it was selected)
+  }
 
   public FlutterSFrame(StateProvider stateProvider) {
     this.stateProvider = stateProvider;
@@ -122,24 +204,26 @@ public class FlutterSFrame {
 
   /** A sender was just created (addTrack / addTransceiver), before its result goes back to Dart. */
   void onSenderCreated(String peerConnectionId, @Nullable RtpSender sender, @Nullable String transceiverKind) {
-    final String storeId = autoAttachStoreId;
-    if (storeId == null || sender == null) return;
+    if (sender == null) return;
+    final Store store = autoAttachStore(); // S-8: the sentinel when armed and nothing is selected
+    if (store == null) return; // never armed: no call has used the plugin yet (stock flutter-webrtc behaviour)
     String kind = transceiverKind;
     MediaStreamTrack t = sender.track();
     if (t != null) kind = t.kind();
     String key = peerConnectionId + "/send/" + sender.id();
     if (byEndpoint.containsKey(key)) return;
-    attach(storeId, peerConnectionId, sender, null, kind, "send:" + kind + ":" + sender.id());
+    attach(store, peerConnectionId, sender, null, kind, "send:" + kind + ":" + sender.id());
   }
 
   /** A remote track arrived (onAddTrack), before the event goes to Dart. */
   void onReceiverAdded(String peerConnectionId, @Nullable RtpReceiver receiver) {
-    final String storeId = autoAttachStoreId;
-    if (storeId == null || receiver == null || receiver.track() == null) return;
+    if (receiver == null || receiver.track() == null) return;
+    final Store store = autoAttachStore(); // S-8, as above
+    if (store == null) return;
     String kind = receiver.track().kind();
     String key = peerConnectionId + "/recv/" + receiver.id();
     if (byEndpoint.containsKey(key)) return;
-    attach(storeId, peerConnectionId, null, receiver, kind, "recv:" + kind + ":" + receiver.track().id());
+    attach(store, peerConnectionId, null, receiver, kind, "recv:" + kind + ":" + receiver.track().id());
   }
 
   static String kindOf(@Nullable RtpTransceiver t) {
@@ -183,13 +267,22 @@ public class FlutterSFrame {
         if (n != null) ks.setStormThreshold((int) asLong(n));
         Boolean h264 = call.argument("h264");
         ks.setH264Enabled(h264 != null && h264);
+        Boolean requireLeg = call.argument("requireLegBinding"); // S-7 / Q1 (AAR >= 150.7871.03-tkm.9)
+        ks.setRequireLegBinding(requireLeg != null && requireLeg);
         String id = UUID.randomUUID().toString();
         Store s = new Store(id, ks, stateProvider.getMessenger());
         ks.setObserver(s);
         stores.put(id, s);
         Map<String, Object> r = new HashMap<>();
         r.put("keyStoreId", id);
+        r.put("requireLegBinding", requireLeg != null && requireLeg); // what this binary enforces
         result.success(r);
+        return;
+      }
+      case "sframeKeyStoreBindLeg": { // S-7 (AAR >= 150.7871.03-tkm.9)
+        String streamId = call.argument("streamId");
+        if (streamId == null) throw new IllegalArgumentException("missing streamId");
+        result.success(store(call).keyStore.bindLeg(streamId, (int) asLong(call.argument("legIndex"))));
         return;
       }
       case "sframeKeyStoreSetKey": {
@@ -247,8 +340,8 @@ public class FlutterSFrame {
         result.success(store(call).keyStore.getStatsJson());
         return;
       case "sframeKeyStoreDispose": {
-        Store s = store(call);
-        if (s.id.equals(autoAttachStoreId)) autoAttachStoreId = null;
+        Store s = store(call); // never the sentinel: it is not in `stores` (S-8)
+        autoAttach.forget(s.id); // armed: the sentinel takes over
         stores.remove(s.id);
         // Cryptors of this store stay attached to their senders/receivers (WebRTC holds them); they keep the
         // store's native object alive and keep failing closed. Only the Java handles go.
@@ -267,7 +360,9 @@ public class FlutterSFrame {
       case "sframeAutoAttach": {
         String id = call.argument("keyStoreId");
         if (id != null && !stores.containsKey(id)) throw new IllegalArgumentException("key store not found");
-        autoAttachStoreId = id;
+        // S-8: Q6 refuses a second store while one is selected (one call plane per process: a second session must
+        // not take over the first one's senders); Q5 arms the sentinel for the life of the process.
+        autoAttach.select(id, stores);
         result.success(null);
         return;
       }
@@ -286,13 +381,13 @@ public class FlutterSFrame {
             if (sender == null) throw new IllegalArgumentException("sender not found");
             String existing = byEndpoint.get(pcId + "/send/" + sender.id());
             id = existing != null ? existing
-                : attach(s.id, pcId, sender, null, kind, streamId != null ? streamId : "send:" + kind + ":" + sender.id());
+                : attach(s, pcId, sender, null, kind, streamId != null ? streamId : "send:" + kind + ":" + sender.id());
           } else {
             RtpReceiver receiver = pco.getRtpReceiverById(call.argument("rtpReceiverId"));
             if (receiver == null) throw new IllegalArgumentException("receiver not found");
             String existing = byEndpoint.get(pcId + "/recv/" + receiver.id());
             id = existing != null ? existing
-                : attach(s.id, pcId, null, receiver, kind, streamId != null ? streamId : "recv:" + kind + ":" + receiver.id());
+                : attach(s, pcId, null, receiver, kind, streamId != null ? streamId : "recv:" + kind + ":" + receiver.id());
           }
         }
         Map<String, Object> r = new HashMap<>();
@@ -337,10 +432,8 @@ public class FlutterSFrame {
   }
 
   /** Returns the cryptor id. Never called with a monitor held (see the maps). */
-  private String attach(String storeId, String pcId, @Nullable RtpSender sender, @Nullable RtpReceiver receiver,
+  private String attach(Store s, String pcId, @Nullable RtpSender sender, @Nullable RtpReceiver receiver,
       String kind, String streamId) {
-    Store s = stores.get(storeId);
-    if (s == null) throw new IllegalStateException("key store gone");
     SFrameCryptor.MediaKind k = "audio".equals(kind) ? SFrameCryptor.MediaKind.AUDIO : SFrameCryptor.MediaKind.VIDEO;
     SFrameCryptor c;
     String key;
@@ -355,9 +448,9 @@ public class FlutterSFrame {
       role = "recv";
     }
     String id = UUID.randomUUID().toString();
-    cryptors.put(id, new Attached(id, storeId, c, role, kind));
+    cryptors.put(id, new Attached(id, s.id, c, role, kind));
     byEndpoint.put(key, id);
-    Log.d(TAG, "attached " + role + " " + kind + " " + streamId);
+    Log.d(TAG, "attached " + role + " " + kind + " " + streamId + (s == sentinel ? " (S-8 sentinel: drops all)" : ""));
     return id;
   }
 }

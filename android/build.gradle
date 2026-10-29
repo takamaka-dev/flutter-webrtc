@@ -17,16 +17,16 @@ buildscript {
 // C182 (Takamaka): the webrtc-sdk fork with the RFC 9605 SFrame transformer, from a local file repository
 // (tool/install_tkm_aar.sh). Override the directory with -PtkmWebrtcMavenRepo=<dir>.
 def tkmWebrtcRepo = project.findProperty('tkmWebrtcMavenRepo') ?: "${projectDir}/local-maven"
-def tkmWebrtcVersion = '150.7871.03-tkm.8' // C-24 hold + C-25 AGC2 / mic-direction (result line at WARN)
+def tkmWebrtcVersion = '150.7871.03-tkm.9' // C-24 hold + C-25 AGC2 / mic-direction + S-7 per-stream leg binding
 
 // C182 B-0 (2026-10-12): when the fork AAR is not in that repository, fetch it from the
 // takamaka-dev/webrtc-build release by TAG and refuse it unless its sha256 is the pinned one —
 // so another PC builds without the 23 GB WebRTC tree. Override with -PtkmWebrtcAarUrl=… and
 // -PtkmWebrtcAarSha256=… (both must change together); -PtkmWebrtcAarOffline=true skips the fetch.
 def tkmWebrtcAarUrl = project.findProperty('tkmWebrtcAarUrl') ?:
-    'https://github.com/takamaka-dev/webrtc-build/releases/download/android-c182-sframe.2/libwebrtc-android-c182-sframe.2.aar'
+    'https://github.com/takamaka-dev/webrtc-build/releases/download/android-c182-sframe.3/libwebrtc-android-c182-sframe.3.aar'
 def tkmWebrtcAarSha256 = project.findProperty('tkmWebrtcAarSha256') ?:
-    '5057f417db9de17671ea1b4afdd11e8b9bc314dc74206ce88aba704519578020'
+    '9c0453a5e2a55a48c5f8fe038c338ae76d991c66177892ac715f9bab56713708' // tkm.9 = fork fix/S7-S8-leg-binding dce2daf; android-c182-sframe.3 must carry this file
 def tkmAarDir = file("${tkmWebrtcRepo}/io/github/webrtc-sdk/android/${tkmWebrtcVersion}")
 def tkmAar = new File(tkmAarDir, "android-${tkmWebrtcVersion}.aar")
 if (!tkmAar.exists() && !Boolean.parseBoolean("${project.findProperty('tkmWebrtcAarOffline') ?: 'false'}")) {
@@ -96,6 +96,11 @@ android {
 
     lintOptions {
         disable 'InvalidPackage'
+    }
+
+    // JVM unit tests (src/test): android.util.Log etc. answer defaults instead of throwing "not mocked".
+    testOptions {
+        unitTests.returnDefaultValues = true
     }
 
     compileOptions {

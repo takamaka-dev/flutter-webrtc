@@ -1,0 +1,87 @@
+package com.cloudwebrtc.webrtc;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
+
+import java.util.HashMap;
+import java.util.Map;
+
+import org.junit.Before;
+import org.junit.Test;
+
+/**
+ * C182 S-8 (rulings Q5/Q6): once a key store was selected for auto-attach, "nothing selected" must attach the
+ * key-less sentinel (everything drops) to every new sender/receiver, never nothing (= media in clear); a second store
+ * cannot be selected while one is.
+ */
+public class FlutterSFrameAutoAttachTest {
+  private final Map<String, Object> live = new HashMap<>();
+
+  @Before
+  public void freshProcess() {
+    FlutterSFrame.AutoAttach.disarmForTest();
+    live.clear();
+  }
+
+  @Test
+  public void neverArmedAttachesNothing() {
+    FlutterSFrame.AutoAttach a = new FlutterSFrame.AutoAttach();
+    assertNull(a.target(live)); // stock flutter-webrtc behaviour until a call selects a store
+    a.select(null, live);
+    assertNull(a.target(live));
+    assertFalse(FlutterSFrame.AutoAttach.armed());
+  }
+
+  @Test
+  public void afterTheFirstSelectionNothingSelectedMeansTheSentinel() {
+    FlutterSFrame.AutoAttach a = new FlutterSFrame.AutoAttach();
+    live.put("call-1", new Object());
+    a.select("call-1", live);
+    assertEquals("call-1", a.target(live));
+    a.select(null, live); // autoAttach(false) at the end of the call
+    assertEquals(FlutterSFrame.SENTINEL_ID, a.target(live));
+    assertTrue(FlutterSFrame.AutoAttach.armed());
+  }
+
+  @Test
+  public void disposingTheSelectedStoreHandsOverToTheSentinel() {
+    FlutterSFrame.AutoAttach a = new FlutterSFrame.AutoAttach();
+    live.put("call-1", new Object());
+    a.select("call-1", live);
+    live.remove("call-1");
+    assertEquals(FlutterSFrame.SENTINEL_ID, a.target(live)); // even before forget(): a dead store never attaches
+    a.forget("call-1");
+    assertNull(a.selected());
+    assertEquals(FlutterSFrame.SENTINEL_ID, a.target(live));
+  }
+
+  @Test
+  public void theLatchOutlivesThePluginInstance() {
+    live.put("call-1", new Object());
+    new FlutterSFrame.AutoAttach().select("call-1", live);
+    FlutterSFrame.AutoAttach next = new FlutterSFrame.AutoAttach(); // a new engine in the same process
+    assertEquals(FlutterSFrame.SENTINEL_ID, next.target(live)); // Q5: armed for the life of the process
+  }
+
+  @Test
+  public void aSecondStoreIsRefusedWhileOneIsSelected() {
+    FlutterSFrame.AutoAttach a = new FlutterSFrame.AutoAttach();
+    live.put("call-1", new Object());
+    live.put("call-2", new Object());
+    a.select("call-1", live);
+    a.select("call-1", live); // the same one again: fine
+    try {
+      a.select("call-2", live);
+      fail("Q6: a second store must be refused while call-1 is selected");
+    } catch (IllegalStateException expected) {
+      // ok
+    }
+    assertEquals("call-1", a.target(live));
+    a.select(null, live); // the first call ends
+    a.select("call-2", live); // the next call may select its store
+    assertEquals("call-2", a.target(live));
+  }
+}

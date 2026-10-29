@@ -2,6 +2,12 @@
 
 // C182 / DR-055 — see FlutterSFrame.h. No key byte is ever logged or sent back to Dart (only the vector seams return
 // units); the NSData copies of base keys handed to the framework are wiped after use.
+//
+// S-8 (rulings Q5/Q6): the first auto-attach selection ARMS the plugin for the life of the process; from then on "no
+// store selected" attaches a key-less SENTINEL store (everything drops) instead of nothing, and selecting a second
+// store while one is selected is refused. S-7: sframeKeyStoreBindLeg / requireLegBinding need the framework with the
+// leg binding (tkm_sframe.patch of fork fix/S7-S8-leg-binding); on an older one bindLeg answers sframe-unavailable and
+// create reports requireLegBinding NO.
 
 #if __has_include(<WebRTC/RTCSFrameKeyStore.h>)
 #define TKM_HAS_SFRAME 1
@@ -38,6 +44,9 @@ static NSString* const kSFrameUnavailable = @"sframe-unavailable";
     _storeId = storeId;
     _keyStore = keyStore;
     _queue = [NSMutableArray array];
+    if (messenger == nil) {  // the S-8 sentinel: no Dart listener, no events
+      return self;
+    }
     _channel = [FlutterEventChannel
         eventChannelWithName:[NSString stringWithFormat:@"FlutterWebRTC/sframeEvents/%@", storeId]
              binaryMessenger:messenger];
@@ -124,6 +133,8 @@ static NSString* const kSFrameUnavailable = @"sframe-unavailable";
 @property(nonatomic, strong) NSMutableDictionary<NSString*, TkmSFrameAttached*>* cryptors;
 @property(nonatomic, strong) NSMutableDictionary<NSString*, NSString*>* byEndpoint;  // "pc/send/<id>" → cryptor id
 @property(nonatomic, copy) NSString* autoAttachStoreId;
+@property(nonatomic, assign) BOOL armed;  // S-8 / Q5: set at the first selection, never cleared
+@property(nonatomic, strong) TkmSFrameStore* sentinel;  // S-8: never in `stores`, never keyed, never disposed
 @end
 @implementation TkmSFrameRegistry
 + (instancetype)shared {
@@ -139,6 +150,38 @@ static NSString* const kSFrameUnavailable = @"sframe-unavailable";
 }
 @end
 
+static NSString* const kTkmSentinelId = @"tkm-sframe-sentinel";
+
+// S-7: -[RTCSFrameKeyStore setRequireLegBinding:] exists only in a framework with the leg binding; by selector so
+// this file still builds against an older one. YES when applied.
+static BOOL TkmSetRequireLegBinding(RTCSFrameKeyStore* ks, BOOL required) {
+  SEL sel = NSSelectorFromString(@"setRequireLegBinding:");
+  if (![ks respondsToSelector:sel]) return NO;
+  NSInvocation* inv = [NSInvocation invocationWithMethodSignature:[ks methodSignatureForSelector:sel]];
+  [inv setSelector:sel];
+  [inv setTarget:ks];
+  [inv setArgument:&required atIndex:2];
+  [inv invoke];
+  return required;
+}
+
+/// S-8: the store a new sender/receiver gets — the selected live store, else (armed) the sentinel, else nil (never
+/// armed: stock behaviour). Takes the registry lock for map operations only.
+static TkmSFrameStore* TkmAutoAttachStore(void) {
+  TkmSFrameRegistry* reg = [TkmSFrameRegistry shared];
+  @synchronized(reg) {
+    TkmSFrameStore* s = reg.autoAttachStoreId != nil ? reg.stores[reg.autoAttachStoreId] : nil;
+    if (s != nil) return s;
+    if (!reg.armed) return nil;
+    if (reg.sentinel == nil) {
+      RTCSFrameKeyStore* ks = [[RTCSFrameKeyStore alloc] init];  // no key, no send KID: everything drops
+      TkmSetRequireLegBinding(ks, YES);                           // and its receivers are never bound (S-7)
+      reg.sentinel = [[TkmSFrameStore alloc] initWithId:kTkmSentinelId keyStore:ks messenger:nil];
+    }
+    return reg.sentinel;
+  }
+}
+
 static NSString* TkmKindOfTransceiver(RTCRtpTransceiver* t) {
   return t.mediaType == RTCRtpMediaTypeAudio ? @"audio" : @"video";
 }
@@ -150,13 +193,9 @@ static void TkmWipe(NSData* data) {
 }
 
 /// Returns the cryptor id, or nil when WebRTC refused (no native sender/receiver). Never under a lock.
-static NSString* TkmAttach(NSString* storeId, NSString* pcId, RTCRtpSender* sender, RTCRtpReceiver* receiver,
+static NSString* TkmAttach(TkmSFrameStore* s, NSString* pcId, RTCRtpSender* sender, RTCRtpReceiver* receiver,
                            NSString* kind, NSString* streamId) {
   TkmSFrameRegistry* reg = [TkmSFrameRegistry shared];
-  TkmSFrameStore* s;
-  @synchronized(reg) {
-    s = reg.stores[storeId];
-  }
   if (s == nil) return nil;
   RTCSFrameMediaKind k = [@"audio" isEqualToString:kind] ? RTCSFrameMediaKindAudio : RTCSFrameMediaKindVideo;
   RTCSFrameCryptor* c;
@@ -171,14 +210,15 @@ static NSString* TkmAttach(NSString* storeId, NSString* pcId, RTCRtpSender* send
   if (c == nil) return nil;
   TkmSFrameAttached* a = [TkmSFrameAttached new];
   a.cryptorId = [[NSUUID UUID] UUIDString];
-  a.storeId = storeId;
+  a.storeId = s.storeId;
   a.cryptor = c;
   a.endpoint = endpoint;
   @synchronized(reg) {
     reg.cryptors[a.cryptorId] = a;
     reg.byEndpoint[endpoint] = a.cryptorId;
   }
-  NSLog(@"FlutterSFrame: attached %@ %@ %@", sender != nil ? @"send" : @"recv", kind, streamId);
+  NSLog(@"FlutterSFrame: attached %@ %@ %@%@", sender != nil ? @"send" : @"recv", kind, streamId,
+        [s.storeId isEqualToString:kTkmSentinelId] ? @" (S-8 sentinel: drops all)" : @"");
   return a.cryptorId;
 }
 
@@ -190,33 +230,29 @@ static NSString* TkmAttach(NSString* storeId, NSString* pcId, RTCRtpSender* send
 
 - (void)sframeOnSenderCreated:(RTCRtpSender*)sender peerConnectionId:(NSString*)peerConnectionId kind:(NSString*)kind {
   TkmSFrameRegistry* reg = [TkmSFrameRegistry shared];
-  NSString* storeId;
-  @synchronized(reg) {
-    storeId = reg.autoAttachStoreId;
-  }
-  if (storeId == nil || sender == nil) return;
+  if (sender == nil) return;
+  TkmSFrameStore* store = TkmAutoAttachStore();  // S-8: the sentinel when armed and nothing is selected
+  if (store == nil) return;                      // never armed: stock behaviour
   NSString* k = sender.track != nil ? sender.track.kind : kind;
   NSString* endpoint = [NSString stringWithFormat:@"%@/send/%@", peerConnectionId, sender.senderId];
   @synchronized(reg) {
     if (reg.byEndpoint[endpoint] != nil) return;
   }
-  TkmAttach(storeId, peerConnectionId, sender, nil, k,
+  TkmAttach(store, peerConnectionId, sender, nil, k,
             [NSString stringWithFormat:@"send:%@:%@", k, sender.senderId]);
 }
 
 - (void)sframeOnReceiverAdded:(RTCRtpReceiver*)receiver peerConnectionId:(NSString*)peerConnectionId {
   TkmSFrameRegistry* reg = [TkmSFrameRegistry shared];
-  NSString* storeId;
-  @synchronized(reg) {
-    storeId = reg.autoAttachStoreId;
-  }
-  if (storeId == nil || receiver == nil || receiver.track == nil) return;
+  if (receiver == nil || receiver.track == nil) return;
+  TkmSFrameStore* store = TkmAutoAttachStore();  // S-8, as above
+  if (store == nil) return;
   NSString* k = receiver.track.kind;
   NSString* endpoint = [NSString stringWithFormat:@"%@/recv/%@", peerConnectionId, receiver.receiverId];
   @synchronized(reg) {
     if (reg.byEndpoint[endpoint] != nil) return;
   }
-  TkmAttach(storeId, peerConnectionId, nil, receiver, k,
+  TkmAttach(store, peerConnectionId, nil, receiver, k,
             [NSString stringWithFormat:@"recv:%@:%@", k, receiver.track.trackId]);
 }
 
@@ -274,12 +310,39 @@ static NSMutableData* TkmBytes(id o) {
     if (n != nil && n != nul) [ks setStormThreshold:(int)TkmLong(n)];
     id h264 = args[@"h264"];
     [ks setH264Enabled:(h264 != nil && h264 != nul && [h264 boolValue])];
+    id requireLeg = args[@"requireLegBinding"];  // S-7 / Q1: applied only by a framework with the leg binding
+    BOOL legBinding = TkmSetRequireLegBinding(ks, requireLeg != nil && requireLeg != nul && [requireLeg boolValue]);
     NSString* sid = [[NSUUID UUID] UUIDString];
     TkmSFrameStore* s = [[TkmSFrameStore alloc] initWithId:sid keyStore:ks messenger:self.messenger];
     @synchronized(reg) {
       reg.stores[sid] = s;
     }
-    result(@{@"keyStoreId" : sid});
+    result(@{@"keyStoreId" : sid, @"requireLegBinding" : @(legBinding)});
+  } else if ([method isEqualToString:@"sframeKeyStoreBindLeg"]) {
+    // S-7: -bindLeg:streamId: exists only in a framework with the leg binding; by selector (as setHoldTime below)
+    RTCSFrameKeyStore* ks = store().keyStore;
+    SEL sel = NSSelectorFromString(@"bindLeg:streamId:");
+    id streamIdArg = args[@"streamId"];
+    if (![streamIdArg isKindOfClass:[NSString class]]) {
+      @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"missing streamId" userInfo:nil];
+    }
+    if (![ks respondsToSelector:sel]) {
+      result([FlutterError errorWithCode:kSFrameUnavailable
+                                 message:@"bindLeg needs the WebRTC framework with the S-7 leg binding"
+                                 details:nil]);
+      return;
+    }
+    NSInteger leg = (NSInteger)TkmLong(args[@"legIndex"]);
+    NSString* streamId = streamIdArg;
+    NSInvocation* inv = [NSInvocation invocationWithMethodSignature:[ks methodSignatureForSelector:sel]];
+    [inv setSelector:sel];
+    [inv setTarget:ks];
+    [inv setArgument:&leg atIndex:2];
+    [inv setArgument:&streamId atIndex:3];
+    [inv invoke];
+    BOOL ok = NO;
+    [inv getReturnValue:&ok];
+    result(@(ok));
   } else if ([method isEqualToString:@"sframeKeyStoreSetKey"]) {
     NSMutableData* key = TkmBytes(args[@"key"]);
     RTCSFrameSetKeyResult r = [store().keyStore setKey:TkmLong(args[@"kid"]) baseKey:key ?: [NSData data]];
@@ -326,6 +389,7 @@ static NSMutableData* TkmBytes(id o) {
   } else if ([method isEqualToString:@"sframeKeyStoreDispose"]) {
     TkmSFrameStore* s = store();
     @synchronized(reg) {
+      // armed (S-8): the sentinel takes over; the sentinel itself is never in `stores`, so never disposed here
       if ([s.storeId isEqualToString:reg.autoAttachStoreId]) reg.autoAttachStoreId = nil;
       [reg.stores removeObjectForKey:s.storeId];
       // Cryptors stay attached to their senders/receivers (WebRTC holds the transformer and, through it, the native
@@ -346,8 +410,18 @@ static NSMutableData* TkmBytes(id o) {
   } else if ([method isEqualToString:@"sframeAutoAttach"]) {
     id sid = args[@"keyStoreId"];
     @synchronized(reg) {
-      if (sid != nil && sid != nul && reg.stores[sid] == nil) {
-        @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"key store not found" userInfo:nil];
+      if (sid != nil && sid != nul) {
+        if (reg.stores[sid] == nil) {
+          @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"key store not found" userInfo:nil];
+        }
+        NSString* current = reg.autoAttachStoreId;
+        if (current != nil && ![current isEqualToString:sid] && reg.stores[current] != nil) {
+          // S-8 / Q6: one call plane per process; a second session must not take over the first one's senders
+          @throw [NSException exceptionWithName:NSInternalInconsistencyException
+                                         reason:@"another key store is selected for auto-attach"
+                                       userInfo:nil];
+        }
+        reg.armed = YES;  // S-8 / Q5: from now on "nothing selected" = the sentinel, never "no transformer"
       }
       reg.autoAttachStoreId = (sid == nul) ? nil : sid;
     }
@@ -373,7 +447,7 @@ static NSMutableData* TkmBytes(id o) {
         cid = reg.byEndpoint[[NSString stringWithFormat:@"%@/send/%@", pcId, sender.senderId]];
       }
       if (cid == nil) {
-        cid = TkmAttach(s.storeId, pcId, sender, nil, kind,
+        cid = TkmAttach(s, pcId, sender, nil, kind,
                         streamId ?: [NSString stringWithFormat:@"send:%@:%@", kind, sender.senderId]);
       }
     } else {
@@ -385,7 +459,7 @@ static NSMutableData* TkmBytes(id o) {
         cid = reg.byEndpoint[[NSString stringWithFormat:@"%@/recv/%@", pcId, receiver.receiverId]];
       }
       if (cid == nil) {
-        cid = TkmAttach(s.storeId, pcId, nil, receiver, kind,
+        cid = TkmAttach(s, pcId, nil, receiver, kind,
                         streamId ?: [NSString stringWithFormat:@"recv:%@:%@", kind, receiver.receiverId]);
       }
     }
