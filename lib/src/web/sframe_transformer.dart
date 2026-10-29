@@ -22,8 +22,14 @@ class SframeUnavailableException implements Exception {
 class SframeKeyStore {
   static Future<bool> available() async => false;
 
-  static Future<SframeKeyStore> create({int stormThreshold = 30, bool h264 = false}) =>
+  static Future<SframeKeyStore> create({int stormThreshold = 30, bool h264 = false, bool requireLegBinding = false}) =>
       throw UnsupportedError('SframeKeyStore: native only (web: use the SFrame worker)');
+
+  bool get legBindingRequired => false;
+
+  /// S-7: native only (the web worker binds with its own `bindLeg` message).
+  Future<bool> bindLeg(String streamId, int? legIndex) =>
+      throw SframeUnavailableException('sframeKeyStoreBindLeg', 'native only (web: use the SFrame worker)');
 
   static Future<Uint8List?> vectorSeal(Uint8List baseKey, int kid, int ctr, Uint8List frame, int prefixLen) =>
       throw UnsupportedError('native only');

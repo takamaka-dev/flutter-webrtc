@@ -13,6 +13,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter/services.dart';
 import 'package:webrtc_interface/webrtc_interface.dart';
 
@@ -110,6 +111,10 @@ class SframeStreamStats {
   int get held => (raw['held'] as num?)?.toInt() ?? 0;
   int get heldReleased => (raw['heldReleased'] as num?)?.toInt() ?? 0;
   int get heldNow => (raw['heldNow'] as num?)?.toInt() ?? 0;
+
+  /// S-7 (receive): the leg_index this stream is bound to ([SframeKeyStore.bindLeg]), or null (unbound, or a binary
+  /// without the binding: AAR < tkm.9).
+  int? get boundLeg => (raw['boundLeg'] as num?)?.toInt();
   int? get lastKid => raw['lastKid'] as int?;
   int? get firstFrameAtMs => raw['firstFrameAtMs'] as int?;
   int? get firstPassAtMs => raw['firstPassAtMs'] as int?;
@@ -152,7 +157,7 @@ int sframeKid(int legIndex, int epoch) {
 
 /// The keys of one call, shared by every transformer of that call (one CTR space per KID, replay window per KID).
 class SframeKeyStore {
-  SframeKeyStore._(this.id) {
+  SframeKeyStore._(this.id, {this.legBindingRequired = false}) {
     _events = EventChannel('FlutterWebRTC/sframeEvents/$id')
         .receiveBroadcastStream()
         .map((e) => SframeEvent.fromMap(e as Map<dynamic, dynamic>))
@@ -160,6 +165,12 @@ class SframeKeyStore {
   }
 
   final String id;
+
+  /// S-7 (ruling Q1): true when the native store enforces the leg binding (created with `requireLegBinding: true`
+  /// on a binary that has it): an unbound receive stream then drops every frame (`unbound`). False on a binary
+  /// without it (AAR < tkm.9, the iOS framework before the S-7 rebuild): there [bindLeg] throws
+  /// [SframeUnavailableException] and the caller's own gates are the only defence.
+  final bool legBindingRequired;
   late final Stream<SframeEvent> _events;
   bool _disposed = false;
 
@@ -176,10 +187,18 @@ class SframeKeyStore {
     }
   }
 
-  static Future<SframeKeyStore> create({int stormThreshold = 30, bool h264 = false}) async {
-    final r = await _sframeCall<Map<dynamic, dynamic>>(
-        'sframeKeyStoreCreate', <String, dynamic>{'stormThreshold': stormThreshold, 'h264': h264});
-    return SframeKeyStore._(r!['keyStoreId'] as String);
+  /// [requireLegBinding] (S-7, ruling Q1): every receive stream of this store drops all frames (`unbound`) until
+  /// [bindLeg] gives it the leg_index of its participant, and afterwards opens only KIDs of that leg (`wrong-leg`
+  /// otherwise; both count toward the storm, Q3). Whether the binary honoured it is [legBindingRequired].
+  static Future<SframeKeyStore> create(
+      {int stormThreshold = 30, bool h264 = false, bool requireLegBinding = false}) async {
+    final r = await _sframeCall<Map<dynamic, dynamic>>('sframeKeyStoreCreate', <String, dynamic>{
+      'stormThreshold': stormThreshold,
+      'h264': h264,
+      'requireLegBinding': requireLegBinding,
+    });
+    return SframeKeyStore._(r!['keyStoreId'] as String,
+        legBindingRequired: r['requireLegBinding'] as bool? ?? false);
   }
 
   Map<String, dynamic> _a([Map<String, dynamic>? more]) {
@@ -222,6 +241,19 @@ class SframeKeyStore {
   /// [Duration.zero] turns holding off. Throws [SframeUnavailableException] on a binary without the hold.
   Future<void> setHoldTime(Duration hold) =>
       _sframeCall<void>('sframeKeyStoreSetHoldTime', _a({'holdMs': hold.inMilliseconds}));
+
+  /// S-7: binds the receive stream(s) labelled [streamId] (= [SframeStreamStats.streamId] of the receiver's
+  /// transformer) to [legIndex] — the verified roster's leg_index of the relay participant whose track it is — or
+  /// unbinds them (null: the participant is not, or no longer, in the verified roster). A bound stream opens only
+  /// KIDs of that leg. False if no receive stream of this store has that label. Throws [SframeUnavailableException]
+  /// on a binary without the binding (AAR < tkm.9; the iOS framework until its S-7 rebuild), [ArgumentError] for a
+  /// leg_index outside 1..65535.
+  Future<bool> bindLeg(String streamId, int? legIndex) async {
+    if (legIndex != null && (legIndex < 1 || legIndex > 0xffff)) throw ArgumentError('leg_index 1..65535');
+    return (await _sframeCall<bool>(
+            'sframeKeyStoreBindLeg', _a({'streamId': streamId, 'legIndex': legIndex ?? -1}))) ??
+        false;
+  }
 
   /// Counters of every live transformer of this store.
   Future<List<SframeStreamStats>> stats() async {
@@ -315,11 +347,18 @@ class SframeKeyStore {
 class SframeTransformer {
   SframeTransformer._(this.id, this.store);
 
+  /// A handle on an existing cryptor id, for tests of code that drives [stats] / [bindLeg] over a mocked channel.
+  @visibleForTesting
+  SframeTransformer.forTesting(this.id, this.store);
+
   final String id;
   final SframeKeyStore store;
 
   Future<SframeStreamStats> stats() async => SframeStreamStats.fromJson(
       (await _sframeCall<String>('sframeCryptorGetStats', <String, dynamic>{'cryptorId': id}))!);
+
+  /// S-7: [SframeKeyStore.bindLeg] for this transformer's stream (a receiver). Same results and exceptions.
+  Future<bool> bindLeg(int? legIndex) async => store.bindLeg((await stats()).streamId, legIndex);
 
   /// Engagement (spec §9.2 [0.2], per subscription): completes when this transformer has handed on
   /// [minPassed] more authenticated frames than at the call (the baseline), or throws on [timeout].
