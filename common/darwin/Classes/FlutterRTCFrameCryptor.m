@@ -61,6 +61,21 @@
                               result:(nonnull FlutterResult)result {
   NSDictionary* constraints = call.arguments;
   NSString* method = call.method;
+  // C182 S-9 (ruling Q7): the stock FrameCryptor / key provider is DISABLED in this fork. Our calls use the RFC 9605
+  // SFrame transformer (FlutterSFrame.m); a stock cryptor attached to the same sender/receiver would replace it (last
+  // SetFrameTransformer wins) with a cipher that passes frames through when it has no key. Every frameCryptor* /
+  // keyProvider* method is refused; the code below is kept only to ease merges from upstream.
+  if ([method hasPrefix:@"frameCryptor"] || [method hasPrefix:@"keyProvider"]) {
+    NSLog(@"FlutterRTCFrameCryptor: refused %@ (S-9: the stock FrameCryptor is disabled in this fork)", method);
+    result([FlutterError
+        errorWithCode:@"frameCryptor-disabled"
+              message:[NSString stringWithFormat:@"%@: the stock FrameCryptor is disabled in this flutter-webrtc fork "
+                                                 @"(C182 S-9); calls are encrypted by the SFrame transformer (sframe*) "
+                                                 @"— never enable livekit e2eeOptions",
+                                                 method]
+              details:nil]);
+    return YES;
+  }
   if ([method isEqualToString:@"frameCryptorFactoryCreateFrameCryptor"]) {
     [self frameCryptorFactoryCreateFrameCryptor:constraints result:result];
   } else if ([method isEqualToString:@"frameCryptorSetKeyIndex"]) {

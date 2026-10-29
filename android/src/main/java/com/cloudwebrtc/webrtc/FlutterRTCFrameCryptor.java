@@ -110,8 +110,28 @@ public class FlutterRTCFrameCryptor {
     public FlutterRTCFrameCryptor(StateProvider stateProvider) {
         this.stateProvider = stateProvider;
     }
+    /**
+     * C182 S-9 (ruling Q7): the stock FrameCryptor / key provider of this fork is DISABLED. Our calls use the RFC 9605
+     * SFrame transformer (FlutterSFrame); a stock cryptor attached to the same sender/receiver would replace it
+     * (last SetFrameTransformer wins) with a cipher that passes frames through when it has no key. Every
+     * frameCryptor* / keyProvider* method is refused; the code below is kept only to ease merges from upstream.
+     */
+    static final String DISABLED_CODE = "frameCryptor-disabled";
+
+    static boolean isStockCryptorMethod(String method) {
+        return method != null && (method.startsWith("frameCryptor") || method.startsWith("keyProvider"));
+    }
+
     public boolean handleMethodCall(MethodCall call, @NonNull Result result) {
         String method_name = call.method;
+        if (isStockCryptorMethod(method_name)) {
+            Log.w(TAG, "refused " + method_name + " (S-9: the stock FrameCryptor is disabled in this fork)");
+            result.error(DISABLED_CODE,
+                method_name + ": the stock FrameCryptor is disabled in this flutter-webrtc fork (C182 S-9); "
+                    + "calls are encrypted by the SFrame transformer (sframe*) — never enable livekit e2eeOptions",
+                null);
+            return true;
+        }
         Map<String, Object> params = (Map<String, Object>) call.arguments;
         if (method_name.equals("frameCryptorFactoryCreateFrameCryptor")) {
             frameCryptorFactoryCreateFrameCryptor(params, result);
