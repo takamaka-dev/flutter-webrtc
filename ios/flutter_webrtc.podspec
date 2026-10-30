@@ -17,7 +17,7 @@ A new flutter plugin project.
   s.dependency 'Flutter'
   # C182 (D-6): our framework (ios/tkm/WebRTC-SDK.podspec, the app Podfile must declare it) - not the stock
   # 150.7871.01, which has no RTCSFrame* and would build the fail-closed binding.
-  s.dependency 'WebRTC-SDK', '150.7871.03-tkm.5'
+  s.dependency 'WebRTC-SDK', '150.7871.03-tkm.9'
   s.ios.deployment_target = '13.0'
   s.static_framework = true
   s.pod_target_xcconfig = {
