@@ -195,8 +195,9 @@ class SframeKeyStore {
   /// afterwards opens only KIDs of that leg (`wrong-leg` otherwise; both count toward the storm, Q3). R1: when it
   /// was requested and the binary does not honour it (AAR < tkm.9, the iOS framework before its S-7 rebuild: the
   /// create answer lacks `requireLegBinding: true`), the store is disposed and [SframeUnavailableException] is
-  /// thrown — never a store that silently opens every KID. Only a caller that passes `false` (tests, vectors) gets
-  /// one without the binding.
+  /// thrown — never a store that silently opens every KID. Only a caller that passes `false` (tests, vectors) asks
+  /// for one without the binding — and since AAR tkm.10 (native default true + one-way latch) the native store
+  /// enforces it anyway; [legBindingRequired] echoes the request, not that latch.
   static Future<SframeKeyStore> create(
       {int stormThreshold = 30, bool h264 = false, bool requireLegBinding = true}) async {
     final r = await _sframeCall<Map<dynamic, dynamic>>('sframeKeyStoreCreate', <String, dynamic>{

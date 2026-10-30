@@ -17,16 +17,21 @@ buildscript {
 // C182 (Takamaka): the webrtc-sdk fork with the RFC 9605 SFrame transformer, from a local file repository
 // (tool/install_tkm_aar.sh). Override the directory with -PtkmWebrtcMavenRepo=<dir>.
 def tkmWebrtcRepo = project.findProperty('tkmWebrtcMavenRepo') ?: "${projectDir}/local-maven"
-def tkmWebrtcVersion = '150.7871.03-tkm.9' // C-24 hold + C-25 AGC2 / mic-direction + S-7 per-stream leg binding
+// tkm.10 (2026-10-30, Iris §7.117 item 2 + native nits, fork fix/iris-7117-native 8549219): require_leg_binding
+// defaults to TRUE natively and is a one-way latch (setRequireLegBinding(false) is ignored) + ever_bound, so EVERY
+// store enforces the S-7 binding whatever the create() argument says; wire KID >= 2^48 = wrong-leg, no storm
+// reset on unbound streams, drop events carry the frame's KID. Before: tkm.9 = C-24 hold + C-25 AGC2 /
+// mic-direction + S-7 per-stream leg binding (android-c182-sframe.3, sha256 9c0453a5...).
+def tkmWebrtcVersion = '150.7871.03-tkm.10'
 
 // C182 B-0 (2026-10-12): when the fork AAR is not in that repository, fetch it from the
 // takamaka-dev/webrtc-build release by TAG and refuse it unless its sha256 is the pinned one —
 // so another PC builds without the 23 GB WebRTC tree. Override with -PtkmWebrtcAarUrl=… and
 // -PtkmWebrtcAarSha256=… (both must change together); -PtkmWebrtcAarOffline=true skips the fetch.
 def tkmWebrtcAarUrl = project.findProperty('tkmWebrtcAarUrl') ?:
-    'https://github.com/takamaka-dev/webrtc-build/releases/download/android-c182-sframe.3/libwebrtc-android-c182-sframe.3.aar'
+    'https://github.com/takamaka-dev/webrtc-build/releases/download/android-c182-sframe.4/libwebrtc-android-c182-sframe.4.aar'
 def tkmWebrtcAarSha256 = project.findProperty('tkmWebrtcAarSha256') ?:
-    '9c0453a5e2a55a48c5f8fe038c338ae76d991c66177892ac715f9bab56713708' // tkm.9 = fork fix/S7-S8-leg-binding dce2daf; android-c182-sframe.3 must carry this file
+    '43fcf24575ce735e2ecb265f04a6d3d3087c76ef44b995ce7cd240ee189034d0' // tkm.10 = fork fix/iris-7117-native 8549219; android-c182-sframe.4 must carry this file (published by the operator; local-maven until then)
 def tkmAarDir = file("${tkmWebrtcRepo}/io/github/webrtc-sdk/android/${tkmWebrtcVersion}")
 def tkmAar = new File(tkmAarDir, "android-${tkmWebrtcVersion}.aar")
 def tkmSha256 = { File f ->
