@@ -29,7 +29,20 @@ def tkmWebrtcAarSha256 = project.findProperty('tkmWebrtcAarSha256') ?:
     '9c0453a5e2a55a48c5f8fe038c338ae76d991c66177892ac715f9bab56713708' // tkm.9 = fork fix/S7-S8-leg-binding dce2daf; android-c182-sframe.3 must carry this file
 def tkmAarDir = file("${tkmWebrtcRepo}/io/github/webrtc-sdk/android/${tkmWebrtcVersion}")
 def tkmAar = new File(tkmAarDir, "android-${tkmWebrtcVersion}.aar")
-if (!tkmAar.exists() && !Boolean.parseBoolean("${project.findProperty('tkmWebrtcAarOffline') ?: 'false'}")) {
+def tkmSha256 = { File f ->
+    def digest = java.security.MessageDigest.getInstance('SHA-256')
+    f.eachByte(1 << 16) { buf, n -> digest.update(buf, 0, n) }
+    digest.digest().encodeHex().toString()
+}
+if (tkmAar.exists()) {
+    // Iris §7.117 8p4 (2026-10-30): an AAR already in the repository is verified too — a stale or tampered file
+    // there used to be linked unchecked.
+    def got = tkmSha256(tkmAar)
+    if (got != tkmWebrtcAarSha256) {
+        throw new GradleException("C182: the fork AAR in ${tkmWebrtcRepo} is not the pinned one (sha256 ${got}, pinned ${tkmWebrtcAarSha256}) - refusing it; remove it to re-fetch, or re-pin both tkmWebrtcAarUrl and tkmWebrtcAarSha256")
+    }
+    logger.lifecycle("C182: fork AAR ${tkmWebrtcVersion} verified in ${tkmWebrtcRepo} (sha256 ${got.take(12)}...)")
+} else if (!Boolean.parseBoolean("${project.findProperty('tkmWebrtcAarOffline') ?: 'false'}")) {
     tkmAarDir.mkdirs()
     def part = new File(tkmAarDir, "android-${tkmWebrtcVersion}.aar.part")
     logger.lifecycle("C182: fork AAR ${tkmWebrtcVersion} not in ${tkmWebrtcRepo} - fetching ${tkmWebrtcAarUrl}")
@@ -39,9 +52,7 @@ if (!tkmAar.exists() && !Boolean.parseBoolean("${project.findProperty('tkmWebrtc
         part.delete()
         throw new GradleException("C182: could not fetch the fork AAR (${e.message}); put it in ${tkmWebrtcRepo} with tool/install_tkm_aar.sh or pass -PtkmWebrtcAarOffline=true", e)
     }
-    def digest = java.security.MessageDigest.getInstance('SHA-256')
-    part.eachByte(1 << 16) { buf, n -> digest.update(buf, 0, n) }
-    def got = digest.digest().encodeHex().toString()
+    def got = tkmSha256(part)
     if (got != tkmWebrtcAarSha256) {
         part.delete()
         throw new GradleException("C182: fork AAR sha256 mismatch (got ${got}, pinned ${tkmWebrtcAarSha256}) - refusing it")
