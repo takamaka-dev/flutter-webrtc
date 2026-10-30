@@ -7,15 +7,28 @@ import 'utils.dart';
 
 class RTCRtpReceiverNative extends RTCRtpReceiver {
   RTCRtpReceiverNative(
-      this._id, this._track, this._parameters, this._peerConnectionId);
+      this._id, this._track, this._parameters, this._peerConnectionId,
+      {this.sframeCryptorId, this.sframeStreamId});
 
   factory RTCRtpReceiverNative.fromMap(Map<dynamic, dynamic> map,
       {required String peerConnectionId}) {
     var track = MediaStreamTrackNative.fromMap(map['track'], peerConnectionId);
     var parameters = RTCRtpParameters.fromMap(map['rtpParameters']);
     return RTCRtpReceiverNative(
-        map['receiverId'], track, parameters, peerConnectionId);
+        map['receiverId'], track, parameters, peerConnectionId,
+        sframeCryptorId: map['sframeCryptorId'] as String?,
+        sframeStreamId: map['sframeStreamId'] as String?);
   }
+
+  /// C182 (Iris §7.117 1-B.4): the SFrame transformer the plugin auto-attached
+  /// to THIS receiver inside onAddTrack, carried on the onTrack event — so the
+  /// transformer is never looked up by receiver id, which libwebrtc takes from
+  /// the relay-chosen msid track id and lets collide across m-sections. Null on
+  /// a receiver the plugin did not attach to (not armed), or from `getReceivers`.
+  final String? sframeCryptorId;
+
+  /// Its stream label (`recv:<kind>:<uuid>`), for `SframeKeyStore.bindLeg`.
+  final String? sframeStreamId;
 
   static List<RTCRtpReceiverNative> fromMaps(List<dynamic> map,
       {required String peerConnectionId}) {

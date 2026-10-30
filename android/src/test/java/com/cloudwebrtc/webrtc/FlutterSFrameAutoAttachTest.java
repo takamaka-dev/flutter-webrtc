@@ -23,6 +23,7 @@ public class FlutterSFrameAutoAttachTest {
   @Before
   public void freshProcess() {
     FlutterSFrame.AutoAttach.disarmForTest();
+    FlutterSFrame.autoAttach.select(null, live);
     live.clear();
   }
 
@@ -64,6 +65,29 @@ public class FlutterSFrameAutoAttachTest {
     new FlutterSFrame.AutoAttach().select("call-1", live);
     FlutterSFrame.AutoAttach next = new FlutterSFrame.AutoAttach(); // a new engine in the same process
     assertEquals(FlutterSFrame.SENTINEL_ID, next.target(live)); // Q5: armed for the life of the process
+  }
+
+  /**
+   * Iris §7.117 item 3: the registry is process-wide. A second engine (a second FlutterSFrame) initialised after
+   * engine 1 selected a store finds that selection as its hook target, and its own selection is refused (Q6).
+   */
+  @Test
+  public void theRegistryIsProcessWideAcrossEngines() {
+    FlutterSFrame engine1 = new FlutterSFrame(null);
+    live.put("call-1", new Object());
+    FlutterSFrame.autoAttach.select("call-1", live);
+    FlutterSFrame engine2 = new FlutterSFrame(null); // a second engine in the same process
+    assertEquals("call-1", FlutterSFrame.autoAttach.target(live)); // engine 1's hooks still reach its store
+    live.put("call-2", new Object());
+    try {
+      FlutterSFrame.autoAttach.select("call-2", live); // engine 2's own call plane
+      fail("Q6: refused while engine 1's store is selected");
+    } catch (IllegalStateException expected) {
+      // ok
+    }
+    assertEquals("call-1", FlutterSFrame.autoAttach.target(live));
+    FlutterSFrame.autoAttach.select(null, live);
+    assertTrue(engine1 != engine2);
   }
 
   @Test

@@ -13,6 +13,11 @@
 // registered until it is disposed so that its event channel handler can be
 // released at that point.
 @property(nonatomic, assign) BOOL closedByPlugin;
+// C182 (Iris §7.117 1-B, twin of Android's F-M2-2 lastOnTrackTransceiver): libwebrtc calls
+// didStartReceivingOnTransceiver: right before didAddReceiver:streams: on the signaling thread. Keeping it gives
+// didAddReceiver the receiver's OWN transceiver (its mid keys the SFrame endpoint) even when two transceivers carry
+// the same relay-chosen receiver id — a scan of `transceivers` by id would always find the first.
+@property(nonatomic, strong, nullable) RTCRtpTransceiver* lastOnTrackTransceiver;
 @end
 
 @interface FlutterWebRTCPlugin (RTCPeerConnection)

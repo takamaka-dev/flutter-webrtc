@@ -7,7 +7,14 @@
 // store selected" attaches a key-less SENTINEL store (everything drops) instead of nothing, and selecting a second
 // store while one is selected is refused. S-7: sframeKeyStoreBindLeg / requireLegBinding need the framework with the
 // leg binding (tkm_sframe.patch of fork fix/S7-S8-leg-binding); on an older one bindLeg answers sframe-unavailable and
-// create reports requireLegBinding NO.
+// create reports requireLegBinding NO (the Dart side then refuses the store: R1).
+//
+// Iris §7.117 item 1 (2026-10-30, parity with FlutterSFrame.java): receive endpoints are keyed by the transceiver
+// MID ("pc/recv/<mid>"), never by the receiver id — libwebrtc takes that id from the relay-chosen msid track id and
+// lets it collide across m-sections; every didAddReceiver attaches a FRESH transformer (the superseded handle goes;
+// WebRTC keeps the last SetFrameTransformer), the stream label is a plugin UUID, a receiver id seen on two mids
+// raises the `duplicate-receiver` event and is refused by "sframeAttachedFor", and the attached cryptor id rides on
+// the onTrack event. 8p2: the hook never throws; 8c: leg_index is range-checked before the cast.
 
 #if __has_include(<WebRTC/RTCSFrameKeyStore.h>)
 #define TKM_HAS_SFRAME 1
@@ -29,6 +36,14 @@ static NSString* const kSFrameUnavailable = @"sframe-unavailable";
 @property(nonatomic, readonly) NSString* storeId;
 @property(nonatomic, readonly) RTCSFrameKeyStore* keyStore;
 @property(nonatomic, strong) FlutterEventChannel* channel;
+/// The delegate entry (tkm.6+ shape), also called by the plugin itself for `duplicate-receiver` (Iris §7.117).
+- (void)sframeKeyStore:(RTCSFrameKeyStore*)keyStore
+      didEventWithType:(NSString*)type
+              streamId:(NSString*)streamId
+                reason:(NSString*)reason
+                   kid:(int64_t)kid
+           consecutive:(int64_t)consecutive
+                 count:(int64_t)count;
 @end
 
 @implementation TkmSFrameStore {
@@ -131,7 +146,11 @@ static NSString* const kSFrameUnavailable = @"sframe-unavailable";
 @interface TkmSFrameRegistry : NSObject
 @property(nonatomic, strong) NSMutableDictionary<NSString*, TkmSFrameStore*>* stores;
 @property(nonatomic, strong) NSMutableDictionary<NSString*, TkmSFrameAttached*>* cryptors;
-@property(nonatomic, strong) NSMutableDictionary<NSString*, NSString*>* byEndpoint;  // "pc/send/<id>" → cryptor id
+// "pc/send/<senderId>" or "pc/recv/<mid>" (Iris §7.117 1-B.2; never the receiver id) → cryptor id
+@property(nonatomic, strong) NSMutableDictionary<NSString*, NSString*>* byEndpoint;
+// Iris §7.117 1-B.3: pc → receiver id → the endpoint it was first seen on; pc → receiver ids seen on two endpoints
+@property(nonatomic, strong) NSMutableDictionary<NSString*, NSMutableDictionary<NSString*, NSString*>*>* recvFirstEndpoint;
+@property(nonatomic, strong) NSMutableDictionary<NSString*, NSMutableSet<NSString*>*>* recvAmbiguous;
 @property(nonatomic, copy) NSString* autoAttachStoreId;
 @property(nonatomic, assign) BOOL armed;  // S-8 / Q5: set at the first selection, never cleared
 @property(nonatomic, strong) TkmSFrameStore* sentinel;  // S-8: never in `stores`, never keyed, never disposed
@@ -145,12 +164,74 @@ static NSString* const kSFrameUnavailable = @"sframe-unavailable";
     r.stores = [NSMutableDictionary dictionary];
     r.cryptors = [NSMutableDictionary dictionary];
     r.byEndpoint = [NSMutableDictionary dictionary];
+    r.recvFirstEndpoint = [NSMutableDictionary dictionary];
+    r.recvAmbiguous = [NSMutableDictionary dictionary];
   });
   return r;
 }
 @end
 
 static NSString* const kTkmSentinelId = @"tkm-sframe-sentinel";
+
+/// Iris §7.117 1-B.2/3 (twin of FlutterSFrame.ReceiverRegistry.admit): the endpoint of a receiver sighting, keyed by
+/// the transceiver mid (unique per description; nil mid → a fresh UUID). The same id on the same mid is a re-sighting
+/// (8p1 reuse): same endpoint. The same id on another mid is a DUPLICATE: *duplicate = YES, *firstEndpoint = where it
+/// was first seen, and the lookup by id refuses from then on. Registry lock for the maps only.
+static NSString* TkmAdmitReceiver(NSString* pcId, NSString* receiverId, NSString* mid, BOOL* duplicate,
+                                  NSString** firstEndpoint) {
+  TkmSFrameRegistry* reg = [TkmSFrameRegistry shared];
+  NSString* endpoint =
+      [NSString stringWithFormat:@"%@/recv/%@", pcId, mid != nil ? mid : [[NSUUID UUID] UUIDString]];
+  *duplicate = NO;
+  *firstEndpoint = nil;
+  @synchronized(reg) {
+    NSMutableDictionary<NSString*, NSString*>* byId = reg.recvFirstEndpoint[pcId];
+    if (byId == nil) reg.recvFirstEndpoint[pcId] = byId = [NSMutableDictionary dictionary];
+    NSString* first = byId[receiverId];
+    if (first == nil) {
+      byId[receiverId] = endpoint;
+    } else if (![first isEqualToString:endpoint] || [reg.recvAmbiguous[pcId] containsObject:receiverId]) {
+      // another m-line — or an id already ambiguous: then EVERY sighting of it is reported (fail closed)
+      NSMutableSet<NSString*>* amb = reg.recvAmbiguous[pcId];
+      if (amb == nil) reg.recvAmbiguous[pcId] = amb = [NSMutableSet set];
+      [amb addObject:receiverId];
+      *duplicate = YES;
+      *firstEndpoint = first;
+    }
+  }
+  return endpoint;
+}
+
+static BOOL TkmReceiverAmbiguous(NSString* pcId, NSString* receiverId) {
+  TkmSFrameRegistry* reg = [TkmSFrameRegistry shared];
+  @synchronized(reg) {
+    return [reg.recvAmbiguous[pcId] containsObject:receiverId];
+  }
+}
+
+/// The endpoint of receiverId on pcId, or nil when never seen or ambiguous (refuse: 1-B.4).
+static NSString* TkmReceiverEndpoint(NSString* pcId, NSString* receiverId) {
+  TkmSFrameRegistry* reg = [TkmSFrameRegistry shared];
+  @synchronized(reg) {
+    if ([reg.recvAmbiguous[pcId] containsObject:receiverId]) return nil;
+    return reg.recvFirstEndpoint[pcId][receiverId];
+  }
+}
+
+/// 8c: a leg_index for bindLeg is -1 (unbind) or 1..65535 — checked BEFORE the NSInteger cast / the framework's
+/// uint32 cast (a raw channel call could otherwise truncate 0x10007 onto leg 7). Twin of FlutterSFrame.legIndexArg.
+static NSInteger TkmLegIndexArg(id o) {
+  if (![o isKindOfClass:[NSNumber class]]) {
+    @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"missing integer" userInfo:nil];
+  }
+  int64_t v = [(NSNumber*)o longLongValue];
+  if (v != -1 && (v < 1 || v > 0xFFFF)) {
+    @throw [NSException exceptionWithName:NSInvalidArgumentException
+                                   reason:@"legIndex must be -1 or 1..65535"
+                                 userInfo:nil];
+  }
+  return (NSInteger)v;
+}
 
 // S-7: -[RTCSFrameKeyStore setRequireLegBinding:] exists only in a framework with the leg binding; by selector so
 // this file still builds against an older one. YES when applied.
@@ -167,12 +248,10 @@ static BOOL TkmSetRequireLegBinding(RTCSFrameKeyStore* ks, BOOL required) {
 
 /// S-8: the store a new sender/receiver gets — the selected live store, else (armed) the sentinel, else nil (never
 /// armed: stock behaviour). Takes the registry lock for map operations only.
-static TkmSFrameStore* TkmAutoAttachStore(void) {
+/// S-8: the key-less sentinel store (created on first use; never in `stores`).
+static TkmSFrameStore* TkmSentinel(void) {
   TkmSFrameRegistry* reg = [TkmSFrameRegistry shared];
   @synchronized(reg) {
-    TkmSFrameStore* s = reg.autoAttachStoreId != nil ? reg.stores[reg.autoAttachStoreId] : nil;
-    if (s != nil) return s;
-    if (!reg.armed) return nil;
     if (reg.sentinel == nil) {
       RTCSFrameKeyStore* ks = [[RTCSFrameKeyStore alloc] init];  // no key, no send KID: everything drops
       TkmSetRequireLegBinding(ks, YES);                           // and its receivers are never bound (S-7)
@@ -180,6 +259,16 @@ static TkmSFrameStore* TkmAutoAttachStore(void) {
     }
     return reg.sentinel;
   }
+}
+
+static TkmSFrameStore* TkmAutoAttachStore(void) {
+  TkmSFrameRegistry* reg = [TkmSFrameRegistry shared];
+  @synchronized(reg) {
+    TkmSFrameStore* s = reg.autoAttachStoreId != nil ? reg.stores[reg.autoAttachStoreId] : nil;
+    if (s != nil) return s;
+    if (!reg.armed) return nil;
+  }
+  return TkmSentinel();
 }
 
 static NSString* TkmKindOfTransceiver(RTCRtpTransceiver* t) {
@@ -192,20 +281,19 @@ static void TkmWipe(NSData* data) {
   }
 }
 
-/// Returns the cryptor id, or nil when WebRTC refused (no native sender/receiver). Never under a lock.
-static NSString* TkmAttach(TkmSFrameStore* s, NSString* pcId, RTCRtpSender* sender, RTCRtpReceiver* receiver,
+/// Attaches a FRESH transformer at `endpoint` and returns its cryptor id, or nil when WebRTC refused (no native
+/// sender/receiver). A handle already at that endpoint is superseded (ours goes; WebRTC keeps the LAST
+/// SetFrameTransformer, as S-9 relies on). Never under a lock.
+static NSString* TkmAttach(TkmSFrameStore* s, NSString* endpoint, RTCRtpSender* sender, RTCRtpReceiver* receiver,
                            NSString* kind, NSString* streamId) {
   TkmSFrameRegistry* reg = [TkmSFrameRegistry shared];
   if (s == nil) return nil;
   RTCSFrameMediaKind k = [@"audio" isEqualToString:kind] ? RTCSFrameMediaKindAudio : RTCSFrameMediaKindVideo;
   RTCSFrameCryptor* c;
-  NSString* endpoint;
   if (sender != nil) {
     c = [[RTCSFrameCryptor alloc] initWithRtpSender:sender keyStore:s.keyStore mediaKind:k streamId:streamId];
-    endpoint = [NSString stringWithFormat:@"%@/send/%@", pcId, sender.senderId];
   } else {
     c = [[RTCSFrameCryptor alloc] initWithRtpReceiver:receiver keyStore:s.keyStore mediaKind:k streamId:streamId];
-    endpoint = [NSString stringWithFormat:@"%@/recv/%@", pcId, receiver.receiverId];
   }
   if (c == nil) return nil;
   TkmSFrameAttached* a = [TkmSFrameAttached new];
@@ -213,13 +301,38 @@ static NSString* TkmAttach(TkmSFrameStore* s, NSString* pcId, RTCRtpSender* send
   a.storeId = s.storeId;
   a.cryptor = c;
   a.endpoint = endpoint;
+  NSString* previous;
   @synchronized(reg) {
+    previous = reg.byEndpoint[endpoint];
     reg.cryptors[a.cryptorId] = a;
     reg.byEndpoint[endpoint] = a.cryptorId;
+    if (previous != nil) [reg.cryptors removeObjectForKey:previous];
   }
+  if (previous != nil) NSLog(@"FlutterSFrame: superseded %@ transformer at %@", sender != nil ? @"send" : @"recv", endpoint);
   NSLog(@"FlutterSFrame: attached %@ %@ %@%@", sender != nil ? @"send" : @"recv", kind, streamId,
         [s.storeId isEqualToString:kTkmSentinelId] ? @" (S-8 sentinel: drops all)" : @"");
   return a.cryptorId;
+}
+
+/// 8p2 parity (twin of FlutterSFrame.attachOrSentinel): an attach from a WebRTC delegate callback must never throw.
+/// ARC keeps the store alive here (no disposed-store exception as on Android), but a refused attach (nil) or any
+/// exception is retried with the sentinel — armed by construction, the store had been selected — and logged.
+static NSString* TkmAttachOrSentinel(TkmSFrameStore* s, NSString* endpoint, RTCRtpSender* sender,
+                                     RTCRtpReceiver* receiver, NSString* kind, NSString* streamId) {
+  NSString* cid = nil;
+  @try {
+    cid = TkmAttach(s, endpoint, sender, receiver, kind, streamId);
+  } @catch (NSException* e) {
+    NSLog(@"FlutterSFrame: attach threw %@: retrying with the S-8 sentinel", e.name);
+  }
+  if (cid != nil || [s.storeId isEqualToString:kTkmSentinelId]) return cid;
+  @try {
+    cid = TkmAttach(TkmSentinel(), endpoint, sender, receiver, kind, streamId);
+  } @catch (NSException* e) {
+    NSLog(@"FlutterSFrame: sentinel attach threw %@", e.name);
+  }
+  if (cid == nil) NSLog(@"FlutterSFrame: NO transformer at %@ (Dart sees none: fail closed)", endpoint);
+  return cid;
 }
 
 #endif  // TKM_HAS_SFRAME
@@ -234,26 +347,40 @@ static NSString* TkmAttach(TkmSFrameStore* s, NSString* pcId, RTCRtpSender* send
   TkmSFrameStore* store = TkmAutoAttachStore();  // S-8: the sentinel when armed and nothing is selected
   if (store == nil) return;                      // never armed: stock behaviour
   NSString* k = sender.track != nil ? sender.track.kind : kind;
-  NSString* endpoint = [NSString stringWithFormat:@"%@/send/%@", peerConnectionId, sender.senderId];
+  NSString* endpoint = [NSString stringWithFormat:@"%@/send/%@", peerConnectionId, sender.senderId];  // local, unique
   @synchronized(reg) {
     if (reg.byEndpoint[endpoint] != nil) return;
   }
-  TkmAttach(store, peerConnectionId, sender, nil, k,
-            [NSString stringWithFormat:@"send:%@:%@", k, sender.senderId]);
+  TkmAttachOrSentinel(store, endpoint, sender, nil, k, [NSString stringWithFormat:@"send:%@:%@", k, sender.senderId]);
 }
 
-- (void)sframeOnReceiverAdded:(RTCRtpReceiver*)receiver peerConnectionId:(NSString*)peerConnectionId {
-  TkmSFrameRegistry* reg = [TkmSFrameRegistry shared];
-  if (receiver == nil || receiver.track == nil) return;
+- (NSDictionary*)sframeOnReceiverAdded:(RTCRtpReceiver*)receiver
+                      peerConnectionId:(NSString*)peerConnectionId
+                                   mid:(NSString*)mid {
+  if (receiver == nil || receiver.track == nil) return nil;
   TkmSFrameStore* store = TkmAutoAttachStore();  // S-8, as above
-  if (store == nil) return;
+  if (store == nil) return nil;
   NSString* k = receiver.track.kind;
-  NSString* endpoint = [NSString stringWithFormat:@"%@/recv/%@", peerConnectionId, receiver.receiverId];
-  @synchronized(reg) {
-    if (reg.byEndpoint[endpoint] != nil) return;
+  BOOL duplicate = NO;
+  NSString* firstEndpoint = nil;
+  NSString* endpoint = TkmAdmitReceiver(peerConnectionId, receiver.receiverId, mid, &duplicate, &firstEndpoint);
+  // The label is ours: the framework's bindLeg binds EVERY receive stream carrying it, so it must never be the
+  // relay-chosen track id.
+  NSString* streamId = [NSString stringWithFormat:@"recv:%@:%@", k, [[NSUUID UUID] UUIDString]];
+  NSString* cid = TkmAttachOrSentinel(store, endpoint, nil, receiver, k, streamId);
+  if (duplicate) {
+    NSLog(@"FlutterSFrame: duplicate receiver id on %@ and %@ (S-7: refused by id)", firstEndpoint, endpoint);
+    [store sframeKeyStore:store.keyStore
+         didEventWithType:@"duplicate-receiver"
+                 streamId:streamId
+                   reason:[NSString stringWithFormat:@"receiver %@ on %@ and %@", receiver.receiverId, firstEndpoint,
+                                                     endpoint]
+                      kid:-1
+              consecutive:0
+                    count:0];
   }
-  TkmAttach(store, peerConnectionId, nil, receiver, k,
-            [NSString stringWithFormat:@"recv:%@:%@", k, receiver.track.trackId]);
+  if (cid == nil) return nil;
+  return @{@"sframeCryptorId" : cid, @"sframeStreamId" : streamId};
 }
 
 static int64_t TkmLong(id o) {
@@ -332,7 +459,7 @@ static NSMutableData* TkmBytes(id o) {
                                  details:nil]);
       return;
     }
-    NSInteger leg = (NSInteger)TkmLong(args[@"legIndex"]);
+    NSInteger leg = TkmLegIndexArg(args[@"legIndex"]);  // 8c: range-checked, else sframeKeyStoreBindLegFailed
     NSString* streamId = streamIdArg;
     NSInvocation* inv = [NSInvocation invocationWithMethodSignature:[ks methodSignatureForSelector:sel]];
     [inv setSelector:sel];
@@ -443,24 +570,39 @@ static NSMutableData* TkmBytes(id o) {
       if (sender == nil) {
         @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"sender not found" userInfo:nil];
       }
+      NSString* endpoint = [NSString stringWithFormat:@"%@/send/%@", pcId, sender.senderId];
       @synchronized(reg) {
-        cid = reg.byEndpoint[[NSString stringWithFormat:@"%@/send/%@", pcId, sender.senderId]];
+        cid = reg.byEndpoint[endpoint];
       }
       if (cid == nil) {
-        cid = TkmAttach(s, pcId, sender, nil, kind,
+        cid = TkmAttach(s, endpoint, sender, nil, kind,
                         streamId ?: [NSString stringWithFormat:@"send:%@:%@", kind, sender.senderId]);
       }
     } else {
-      RTCRtpReceiver* receiver = [self getRtpReceiverById:pc Id:args[@"rtpReceiverId"]];
+      NSString* receiverId = args[@"rtpReceiverId"];
+      RTCRtpReceiver* receiver = [self getRtpReceiverById:pc Id:receiverId];
       if (receiver == nil) {
         @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"receiver not found" userInfo:nil];
       }
-      @synchronized(reg) {
-        cid = reg.byEndpoint[[NSString stringWithFormat:@"%@/recv/%@", pcId, receiver.receiverId]];
+      if (TkmReceiverAmbiguous(pcId, receiverId)) {
+        @throw [NSException exceptionWithName:NSInternalInconsistencyException
+                                       reason:@"receiver id is ambiguous on this peer connection (S-7 duplicate)"
+                                     userInfo:nil];
+      }
+      NSString* endpoint = TkmReceiverEndpoint(pcId, receiverId);
+      if (endpoint != nil) {
+        @synchronized(reg) {
+          cid = reg.byEndpoint[endpoint];
+        }
       }
       if (cid == nil) {
-        cid = TkmAttach(s, pcId, nil, receiver, kind,
-                        streamId ?: [NSString stringWithFormat:@"recv:%@:%@", kind, receiver.receiverId]);
+        if (endpoint == nil) {  // never auto-attached (not armed)
+          BOOL dup = NO;
+          NSString* first = nil;
+          endpoint = TkmAdmitReceiver(pcId, receiverId, nil, &dup, &first);
+        }
+        cid = TkmAttach(s, endpoint, nil, receiver, kind,
+                        streamId ?: [NSString stringWithFormat:@"recv:%@:%@", kind, [[NSUUID UUID] UUIDString]]);
       }
     }
     if (cid == nil) {
@@ -470,12 +612,15 @@ static NSMutableData* TkmBytes(id o) {
   } else if ([method isEqualToString:@"sframeAttachedFor"]) {
     NSString* pcId = args[@"peerConnectionId"];
     id senderId = args[@"rtpSenderId"];
+    // 1-B.4: a receiver id seen on two m-lines is ambiguous → nil (refuse); never seen → nil
     NSString* endpoint = (senderId != nil && senderId != nul)
                              ? [NSString stringWithFormat:@"%@/send/%@", pcId, senderId]
-                             : [NSString stringWithFormat:@"%@/recv/%@", pcId, args[@"rtpReceiverId"]];
-    NSString* cid;
-    @synchronized(reg) {
-      cid = reg.byEndpoint[endpoint];
+                             : TkmReceiverEndpoint(pcId, args[@"rtpReceiverId"]);
+    NSString* cid = nil;
+    if (endpoint != nil) {
+      @synchronized(reg) {
+        cid = reg.byEndpoint[endpoint];
+      }
     }
     result(cid);
   } else if ([method isEqualToString:@"sframeCryptorGetStats"]) {
@@ -520,7 +665,10 @@ static NSMutableData* TkmBytes(id o) {
 - (void)sframeOnSenderCreated:(RTCRtpSender*)sender peerConnectionId:(NSString*)peerConnectionId kind:(NSString*)kind {
 }
 
-- (void)sframeOnReceiverAdded:(RTCRtpReceiver*)receiver peerConnectionId:(NSString*)peerConnectionId {
+- (NSDictionary*)sframeOnReceiverAdded:(RTCRtpReceiver*)receiver
+                      peerConnectionId:(NSString*)peerConnectionId
+                                   mid:(NSString*)mid {
+  return nil;
 }
 
 - (BOOL)handleSFrameMethodCall:(nonnull FlutterMethodCall*)call result:(nonnull FlutterResult)result {

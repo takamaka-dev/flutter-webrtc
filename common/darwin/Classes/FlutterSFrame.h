@@ -30,7 +30,14 @@
                          kind:(nullable NSString*)kind;
 
 /// Auto-attach hook: a remote receiver was added (didAddReceiver), before the onTrack event goes to Dart.
-- (void)sframeOnReceiverAdded:(nullable RTCRtpReceiver*)receiver
-             peerConnectionId:(nonnull NSString*)peerConnectionId;
+/// [mid] is the receiver's transceiver mid (nil: unknown). Iris §7.117 1-B (twin of FlutterSFrame.java): the
+/// endpoint is keyed by that mid — never by the receiver id, which libwebrtc takes from the relay-chosen msid track
+/// id — a FRESH transformer is attached on every sighting (unbound until Dart binds it), a receiver id seen on two
+/// mids raises the `duplicate-receiver` store event, and the attached transformer is returned as
+/// @{@"sframeCryptorId", @"sframeStreamId"} for the onTrack event's receiver map (nil when nothing was attached).
+/// Never throws (8p2 parity).
+- (nullable NSDictionary*)sframeOnReceiverAdded:(nullable RTCRtpReceiver*)receiver
+                               peerConnectionId:(nonnull NSString*)peerConnectionId
+                                            mid:(nullable NSString*)mid;
 
 @end

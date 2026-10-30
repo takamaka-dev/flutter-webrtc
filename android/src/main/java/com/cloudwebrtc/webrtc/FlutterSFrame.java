@@ -13,6 +13,21 @@
 // instead of nothing: its senders drop every frame (no send KID), its receivers every frame (unbound / no key). So a
 // sender or receiver created between two calls, or by a late renegotiation after the call ended, is never left
 // without a transformer (= media in clear). While one store is selected, selecting another is refused.
+//
+// Iris §7.117 (2026-10-30, rschat-docs/analysis/C182_IRIS_7117_VERIFICATION_2026-10-30.md §3 1-B / 3):
+// * item 1 (blocker): libwebrtc gives a receiver created from the remote description the msid TRACK ID the offerer
+//   chose (M150, sdp_offer_answer.cc:4487) and allows receiver ids to collide across m-sections
+//   (rtp_transmission_manager.cc:286). Receive endpoints are therefore keyed by the transceiver MID (unique per
+//   description), every onAddTrack attaches a FRESH transformer (the superseded handle goes; WebRTC keeps the last
+//   SetFrameTransformer), the stream label is a plugin UUID (never the relay-chosen track id), a receiver id seen on
+//   two m-lines raises the `duplicate-receiver` event and is refused by "sframeAttachedFor", and the cryptor id of
+//   the attached transformer rides on the onTrack event so Dart never has to look it up by receiver id.
+// * item 3: the registry (stores, cryptors, endpoints, the auto-attach selection) is PROCESS-WIDE, as on iOS: a
+//   second Flutter engine (add-to-app, a background isolate that touches the plugin, a hot restart) shares it, so
+//   Q6 holds per process and no observer is routed through a "last engine". A store remembers the messenger of the
+//   engine that created it (its EventChannel).
+// * 8p2: the receiver hook never throws out of the JNI callback (a store disposed between the pick and the attach
+//   → retry with the sentinel). 8c: leg_index is range-checked before the int cast.
 package com.cloudwebrtc.webrtc;
 
 import android.util.Log;
@@ -31,8 +46,10 @@ import org.webrtc.SFrameKeyStore;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -43,9 +60,6 @@ import io.flutter.plugin.common.MethodChannel.Result;
 
 public class FlutterSFrame {
   private static final String TAG = "FlutterSFrame";
-
-  /** The plugin's instance, for the PeerConnectionObserver hooks. */
-  @Nullable static volatile FlutterSFrame instance;
 
   private static final class Store implements SFrameKeyStore.Observer {
     final String id;
@@ -114,22 +128,36 @@ public class FlutterSFrame {
     }
   }
 
+  /** What the receiver hook attached, for the onTrack event (Iris §7.117 1-B.4); both null when nothing was. */
+  static final class Attachment {
+    static final Attachment NONE = new Attachment(null, null);
+    @Nullable final String cryptorId;
+    @Nullable final String streamId;
+
+    Attachment(@Nullable String cryptorId, @Nullable String streamId) {
+      this.cryptorId = cryptorId;
+      this.streamId = streamId;
+    }
+  }
+
   private final StateProvider stateProvider;
-  // Concurrent maps and NO monitor held across native calls: attaching calls into WebRTC proxies that block on the
-  // signaling thread, which itself calls onReceiverAdded — a lock held here across those calls could deadlock.
-  private final Map<String, Store> stores = new ConcurrentHashMap<>();
-  private final Map<String, Attached> cryptors = new ConcurrentHashMap<>();
-  /** "pc/send/<senderId>" or "pc/recv/<receiverId>" → attached cryptor id. */
-  private final Map<String, String> byEndpoint = new ConcurrentHashMap<>();
-  private final AutoAttach autoAttach = new AutoAttach();
+  // PROCESS-WIDE registry (Iris §7.117 item 3). Concurrent maps and NO monitor held across native calls: attaching
+  // calls into WebRTC proxies that block on the signaling thread, which itself calls onReceiverAdded — a lock held
+  // here across those calls could deadlock.
+  private static final Map<String, Store> stores = new ConcurrentHashMap<>();
+  private static final Map<String, Attached> cryptors = new ConcurrentHashMap<>();
+  /** "pc/send/<senderId>" or "pc/recv/<mid>" (Iris §7.117 1-B.2; never the receiver id) → attached cryptor id. */
+  private static final Map<String, String> byEndpoint = new ConcurrentHashMap<>();
+  static final AutoAttach autoAttach = new AutoAttach();
+  static final ReceiverRegistry receivers = new ReceiverRegistry();
 
   /** S-8: the key-less store auto-attached while armed and nothing is selected. Never in {@link #stores}. */
   @Nullable private static Store sentinel;
   static final String SENTINEL_ID = "tkm-sframe-sentinel";
 
   /**
-   * S-8 (rulings Q5/Q6): the auto-attach selection of one plugin instance + the process-wide "armed" latch. Pure
-   * state, no JNI (unit-tested in FlutterSFrameAutoAttachTest).
+   * S-8 (rulings Q5/Q6): the process-wide auto-attach selection + the "armed" latch. Pure state, no JNI (unit-tested
+   * in FlutterSFrameAutoAttachTest).
    */
   static final class AutoAttach {
     /** Q5: set at the first selection of a store, never cleared for the life of the process. */
@@ -176,6 +204,77 @@ public class FlutterSFrame {
     }
   }
 
+  /**
+   * Iris §7.117 item 1: the receive endpoints of every peer connection, keyed by the transceiver MID — unique per
+   * description (sdp_offer_answer.cc:551) — never by the receiver id, which libwebrtc takes from the remote msid
+   * track id and lets collide across m-sections. A receiver id seen on two endpoints of one peer connection is
+   * AMBIGUOUS: the lookup by id answers null (refuse) from then on. Pure state, no JNI (unit-tested in
+   * FlutterSFrameReceiverRegistryTest).
+   */
+  static final class ReceiverRegistry {
+    static final class Admission {
+      /** "pc/recv/<mid>", or "pc/recv/<uuid>" when the transceiver has no mid yet. */
+      final String endpoint;
+      /** The endpoint this receiver id was first seen on, when {@link #duplicate}. */
+      @Nullable final String firstEndpoint;
+      /** This receiver id is now on more than one endpoint of this peer connection. */
+      final boolean duplicate;
+
+      Admission(String endpoint, @Nullable String firstEndpoint, boolean duplicate) {
+        this.endpoint = endpoint;
+        this.firstEndpoint = firstEndpoint;
+        this.duplicate = duplicate;
+      }
+    }
+
+    /** pc → receiver id → the endpoint it was first seen on. */
+    private final Map<String, Map<String, String>> firstEndpoint = new HashMap<>();
+    /** pc → receiver ids seen on more than one endpoint. */
+    private final Map<String, Set<String>> ambiguous = new HashMap<>();
+
+    /** A sighting of {@code receiverId} on the transceiver {@code mid} (null: no mid → a fresh UUID endpoint). */
+    synchronized Admission admit(String pcId, String receiverId, @Nullable String mid) {
+      final String endpoint = pcId + "/recv/" + (mid != null ? mid : UUID.randomUUID().toString());
+      Map<String, String> byId = firstEndpoint.get(pcId);
+      if (byId == null) firstEndpoint.put(pcId, byId = new HashMap<>());
+      final String first = byId.get(receiverId);
+      if (first == null) {
+        byId.put(receiverId, endpoint);
+        return new Admission(endpoint, null, false);
+      }
+      // the same m-line again (8p1 reuse) is fine — unless the id is already ambiguous: then EVERY sighting of it
+      // is reported (fail closed), whichever m-line it comes on
+      if (first.equals(endpoint) && !isAmbiguousLocked(pcId, receiverId)) return new Admission(endpoint, null, false);
+      Set<String> amb = ambiguous.get(pcId);
+      if (amb == null) ambiguous.put(pcId, amb = new HashSet<>());
+      amb.add(receiverId);
+      return new Admission(endpoint, first, true);
+    }
+
+    /** The endpoint of {@code receiverId} on {@code pcId}; null when never seen or ambiguous (refuse: 1-B.4). */
+    @Nullable
+    synchronized String endpointOf(String pcId, String receiverId) {
+      if (isAmbiguous(pcId, receiverId)) return null;
+      final Map<String, String> byId = firstEndpoint.get(pcId);
+      return byId == null ? null : byId.get(receiverId);
+    }
+
+    synchronized boolean isAmbiguous(String pcId, String receiverId) {
+      return isAmbiguousLocked(pcId, receiverId);
+    }
+
+    private boolean isAmbiguousLocked(String pcId, String receiverId) {
+      final Set<String> amb = ambiguous.get(pcId);
+      return amb != null && amb.contains(receiverId);
+    }
+
+    /** Tests only. */
+    synchronized void clearForTest() {
+      firstEndpoint.clear();
+      ambiguous.clear();
+    }
+  }
+
   private static synchronized Store sentinel() {
     if (sentinel == null) {
       SFrameKeyStore ks = SFrameKeyStore.create(); // never a key, never a send KID: everything drops
@@ -185,10 +284,16 @@ public class FlutterSFrame {
     return sentinel;
   }
 
+  /** The store id a new sender/receiver gets (pure: the process-wide selection over the live stores). */
+  @Nullable
+  static String hookTargetId() {
+    return autoAttach.target(stores);
+  }
+
   /** The store a new sender/receiver gets: the selected one, else (armed) the sentinel, else none (never armed). */
   @Nullable
-  private Store autoAttachStore() {
-    final String id = autoAttach.target(stores);
+  private static Store autoAttachStore() {
+    final String id = hookTargetId();
     if (id == null) return null;
     if (SENTINEL_ID.equals(id)) return sentinel();
     final Store s = stores.get(id);
@@ -197,33 +302,45 @@ public class FlutterSFrame {
 
   public FlutterSFrame(StateProvider stateProvider) {
     this.stateProvider = stateProvider;
-    instance = this;
   }
 
-  // ---- hooks called by PeerConnectionObserver ------------------------------------------------------------------
+  // ---- hooks called by PeerConnectionObserver (static: Iris §7.117 item 3) --------------------------------------
 
   /** A sender was just created (addTrack / addTransceiver), before its result goes back to Dart. */
-  void onSenderCreated(String peerConnectionId, @Nullable RtpSender sender, @Nullable String transceiverKind) {
+  static void onSenderCreated(String peerConnectionId, @Nullable RtpSender sender, @Nullable String transceiverKind) {
     if (sender == null) return;
     final Store store = autoAttachStore(); // S-8: the sentinel when armed and nothing is selected
     if (store == null) return; // never armed: no call has used the plugin yet (stock flutter-webrtc behaviour)
     String kind = transceiverKind;
     MediaStreamTrack t = sender.track();
     if (t != null) kind = t.kind();
-    String key = peerConnectionId + "/send/" + sender.id();
+    String key = peerConnectionId + "/send/" + sender.id(); // sender ids are local and unique
     if (byEndpoint.containsKey(key)) return;
-    attach(store, peerConnectionId, sender, null, kind, "send:" + kind + ":" + sender.id());
+    attachOrSentinel(store, key, sender, null, kind, "send:" + kind + ":" + sender.id());
   }
 
-  /** A remote track arrived (onAddTrack), before the event goes to Dart. */
-  void onReceiverAdded(String peerConnectionId, @Nullable RtpReceiver receiver) {
-    if (receiver == null || receiver.track() == null) return;
+  /**
+   * A remote track arrived (onAddTrack), before the event goes to Dart. {@code mid} is the receiver's transceiver mid
+   * (null: unknown). Iris §7.117 1-B: ALWAYS attaches a fresh transformer (unbound until Dart binds it), keyed by
+   * the mid; a receiver id already seen on another mid raises `duplicate-receiver` on the store's channel (the
+   * receiver still gets its transformer and stays unbound). Never throws (8p2).
+   */
+  static Attachment onReceiverAdded(String peerConnectionId, @Nullable RtpReceiver receiver, @Nullable String mid) {
+    if (receiver == null || receiver.track() == null) return Attachment.NONE;
     final Store store = autoAttachStore(); // S-8, as above
-    if (store == null) return;
+    if (store == null) return Attachment.NONE;
     String kind = receiver.track().kind();
-    String key = peerConnectionId + "/recv/" + receiver.id();
-    if (byEndpoint.containsKey(key)) return;
-    attach(store, peerConnectionId, null, receiver, kind, "recv:" + kind + ":" + receiver.track().id());
+    ReceiverRegistry.Admission adm = receivers.admit(peerConnectionId, receiver.id(), mid);
+    // The label is ours: the native BindLeg binds EVERY receive stream carrying it (sframe_transformer.cc:388), so it
+    // must never be the relay-chosen track id.
+    String streamId = "recv:" + kind + ":" + UUID.randomUUID();
+    String id = attachOrSentinel(store, adm.endpoint, null, receiver, kind, streamId);
+    if (adm.duplicate) {
+      Log.w(TAG, "duplicate receiver id on " + adm.firstEndpoint + " and " + adm.endpoint + " (S-7: refused by id)");
+      store.onSFrameEvent("duplicate-receiver", streamId,
+          "receiver " + receiver.id() + " on " + adm.firstEndpoint + " and " + adm.endpoint, -1, 0, 0);
+    }
+    return id == null ? Attachment.NONE : new Attachment(id, streamId);
   }
 
   static String kindOf(@Nullable RtpTransceiver t) {
@@ -249,7 +366,15 @@ public class FlutterSFrame {
     return ((Number) o).longValue();
   }
 
-  private Store store(MethodCall call) {
+  /** 8c: a leg_index for bindLeg is -1 (unbind) or 1..65535 — checked BEFORE the int cast (a raw channel call could
+   * otherwise truncate 0x10007 onto leg 7). */
+  static int legIndexArg(Object o) {
+    long v = asLong(o);
+    if (v != -1 && (v < 1 || v > 0xFFFF)) throw new IllegalArgumentException("legIndex must be -1 or 1..65535");
+    return (int) v;
+  }
+
+  private static Store store(MethodCall call) {
     Store s = stores.get((String) call.argument("keyStoreId"));
     if (s == null) throw new IllegalArgumentException("key store not found");
     return s;
@@ -270,7 +395,7 @@ public class FlutterSFrame {
         Boolean requireLeg = call.argument("requireLegBinding"); // S-7 / Q1 (AAR >= 150.7871.03-tkm.9)
         ks.setRequireLegBinding(requireLeg != null && requireLeg);
         String id = UUID.randomUUID().toString();
-        Store s = new Store(id, ks, stateProvider.getMessenger());
+        Store s = new Store(id, ks, stateProvider.getMessenger()); // this engine's messenger (item 3)
         ks.setObserver(s);
         stores.put(id, s);
         Map<String, Object> r = new HashMap<>();
@@ -282,7 +407,7 @@ public class FlutterSFrame {
       case "sframeKeyStoreBindLeg": { // S-7 (AAR >= 150.7871.03-tkm.9)
         String streamId = call.argument("streamId");
         if (streamId == null) throw new IllegalArgumentException("missing streamId");
-        result.success(store(call).keyStore.bindLeg(streamId, (int) asLong(call.argument("legIndex"))));
+        result.success(store(call).keyStore.bindLeg(streamId, legIndexArg(call.argument("legIndex"))));
         return;
       }
       case "sframeKeyStoreSetKey": {
@@ -375,19 +500,27 @@ public class FlutterSFrame {
         String kind = call.argument("kind");
         String streamId = call.argument("streamId");
         String id;
-        {
-          if (call.method.equals("sframeAttachToSender")) {
-            RtpSender sender = pco.getRtpSenderById(call.argument("rtpSenderId"));
-            if (sender == null) throw new IllegalArgumentException("sender not found");
-            String existing = byEndpoint.get(pcId + "/send/" + sender.id());
-            id = existing != null ? existing
-                : attach(s, pcId, sender, null, kind, streamId != null ? streamId : "send:" + kind + ":" + sender.id());
+        if (call.method.equals("sframeAttachToSender")) {
+          RtpSender sender = pco.getRtpSenderById(call.argument("rtpSenderId"));
+          if (sender == null) throw new IllegalArgumentException("sender not found");
+          String key = pcId + "/send/" + sender.id();
+          String existing = byEndpoint.get(key);
+          id = existing != null ? existing
+              : attach(s, key, sender, null, kind, streamId != null ? streamId : "send:" + kind + ":" + sender.id());
+        } else {
+          String receiverId = call.argument("rtpReceiverId");
+          RtpReceiver receiver = pco.getRtpReceiverById(receiverId);
+          if (receiver == null) throw new IllegalArgumentException("receiver not found");
+          if (receivers.isAmbiguous(pcId, receiverId)) {
+            throw new IllegalStateException("receiver id is ambiguous on this peer connection (S-7 duplicate)");
+          }
+          String key = receivers.endpointOf(pcId, receiverId);
+          String existing = key == null ? null : byEndpoint.get(key);
+          if (existing != null) {
+            id = existing;
           } else {
-            RtpReceiver receiver = pco.getRtpReceiverById(call.argument("rtpReceiverId"));
-            if (receiver == null) throw new IllegalArgumentException("receiver not found");
-            String existing = byEndpoint.get(pcId + "/recv/" + receiver.id());
-            id = existing != null ? existing
-                : attach(s, pcId, null, receiver, kind, streamId != null ? streamId : "recv:" + kind + ":" + receiver.id());
+            if (key == null) key = receivers.admit(pcId, receiverId, null).endpoint; // never auto-attached (not armed)
+            id = attach(s, key, null, receiver, kind, streamId != null ? streamId : "recv:" + kind + ":" + UUID.randomUUID());
           }
         }
         Map<String, Object> r = new HashMap<>();
@@ -399,8 +532,13 @@ public class FlutterSFrame {
         String pcId = call.argument("peerConnectionId");
         String senderId = call.argument("rtpSenderId");
         String receiverId = call.argument("rtpReceiverId");
-        String id = senderId != null ? byEndpoint.get(pcId + "/send/" + senderId)
-            : byEndpoint.get(pcId + "/recv/" + receiverId);
+        String id;
+        if (senderId != null) {
+          id = byEndpoint.get(pcId + "/send/" + senderId);
+        } else {
+          String key = receivers.endpointOf(pcId, receiverId); // null = never seen or ambiguous: refuse
+          id = key == null ? null : byEndpoint.get(key);
+        }
         result.success(id);
         return;
       }
@@ -431,25 +569,56 @@ public class FlutterSFrame {
     }
   }
 
-  /** Returns the cryptor id. Never called with a monitor held (see the maps). */
-  private String attach(Store s, String pcId, @Nullable RtpSender sender, @Nullable RtpReceiver receiver,
+  /**
+   * 8p2: {@link #attach} from a JNI callback must never throw. A store disposed between the pick and the attach
+   * throws IllegalStateException (SFrameKeyStore.getNativeKeyStore → checkExists): retry with the sentinel, which
+   * is armed by construction (the store had been selected). Anything else is logged; the endpoint then has no
+   * transformer handle and Dart (sframeAttachedFor / the event) sees none — fail closed on its side.
+   */
+  @Nullable
+  private static String attachOrSentinel(Store s, String endpoint, @Nullable RtpSender sender,
+      @Nullable RtpReceiver receiver, String kind, String streamId) {
+    try {
+      return attach(s, endpoint, sender, receiver, kind, streamId);
+    } catch (IllegalStateException e) {
+      Log.w(TAG, "attach to a disposed store (" + e.getMessage() + "): retrying with the S-8 sentinel");
+      try {
+        return attach(sentinel(), endpoint, sender, receiver, kind, streamId);
+      } catch (RuntimeException e2) {
+        Log.e(TAG, "sentinel attach failed: " + e2.getClass().getSimpleName());
+        return null;
+      }
+    } catch (RuntimeException e) {
+      Log.e(TAG, "attach failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+      return null;
+    }
+  }
+
+  /**
+   * Attaches a fresh transformer at {@code endpoint} and returns its cryptor id. A handle already at that endpoint
+   * is superseded (its Java handle goes; WebRTC keeps the LAST SetFrameTransformer, as S-9 relies on). Never called
+   * with a monitor held (see the maps).
+   */
+  private static String attach(Store s, String endpoint, @Nullable RtpSender sender, @Nullable RtpReceiver receiver,
       String kind, String streamId) {
     SFrameCryptor.MediaKind k = "audio".equals(kind) ? SFrameCryptor.MediaKind.AUDIO : SFrameCryptor.MediaKind.VIDEO;
     SFrameCryptor c;
-    String key;
     String role;
     if (sender != null) {
       c = SFrameCryptor.createForRtpSender(sender, s.keyStore, k, streamId);
-      key = pcId + "/send/" + sender.id();
       role = "send";
     } else {
       c = SFrameCryptor.createForRtpReceiver(receiver, s.keyStore, k, streamId);
-      key = pcId + "/recv/" + receiver.id();
       role = "recv";
     }
     String id = UUID.randomUUID().toString();
     cryptors.put(id, new Attached(id, s.id, c, role, kind));
-    byEndpoint.put(key, id);
+    String previous = byEndpoint.put(endpoint, id);
+    if (previous != null) {
+      Attached old = cryptors.remove(previous);
+      if (old != null) old.cryptor.dispose();
+      Log.d(TAG, "superseded " + role + " transformer at " + endpoint);
+    }
     Log.d(TAG, "attached " + role + " " + kind + " " + streamId + (s == sentinel ? " (S-8 sentinel: drops all)" : ""));
     return id;
   }

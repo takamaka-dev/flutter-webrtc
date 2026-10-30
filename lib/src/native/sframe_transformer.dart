@@ -60,7 +60,10 @@ class SframeEvent {
       (m['consecutive'] as num?)?.toInt() ?? 0,
       count: (m['count'] as num?)?.toInt() ?? 0);
 
-  /// `engaged`, `first-pass`, `dropping`, `storm`, `recovered`, `resumed`, `key-expired`, `key-evicted`.
+  /// `engaged`, `first-pass`, `dropping`, `storm`, `recovered`, `resumed`, `key-expired`, `key-evicted`, `held`,
+  /// `released`; and `duplicate-receiver` (Iris §7.117 item 1): a receiver id — the relay-chosen msid track id —
+  /// arrived on a second m-line of one peer connection. [streamId] is the label of the (unbound) transformer the
+  /// duplicate got, [reason] names both endpoints. A call that sees it must fail: the relay is misbehaving.
   final String type;
   final String streamId;
 
@@ -167,9 +170,9 @@ class SframeKeyStore {
   final String id;
 
   /// S-7 (ruling Q1): true when the native store enforces the leg binding (created with `requireLegBinding: true`
-  /// on a binary that has it): an unbound receive stream then drops every frame (`unbound`). False on a binary
-  /// without it (AAR < tkm.9, the iOS framework before the S-7 rebuild): there [bindLeg] throws
-  /// [SframeUnavailableException] and the caller's own gates are the only defence.
+  /// on a binary that has it): an unbound receive stream then drops every frame (`unbound`). False only for a store
+  /// created with `requireLegBinding: false` (tests, vectors): since R1 (Iris §7.117, 2026-10-30) [create] throws
+  /// instead of handing back a store whose binding the binary silently ignored.
   final bool legBindingRequired;
   late final Stream<SframeEvent> _events;
   bool _disposed = false;
@@ -187,18 +190,32 @@ class SframeKeyStore {
     }
   }
 
-  /// [requireLegBinding] (S-7, ruling Q1): every receive stream of this store drops all frames (`unbound`) until
-  /// [bindLeg] gives it the leg_index of its participant, and afterwards opens only KIDs of that leg (`wrong-leg`
-  /// otherwise; both count toward the storm, Q3). Whether the binary honoured it is [legBindingRequired].
+  /// [requireLegBinding] (S-7, ruling Q1; the DEFAULT since R2, Iris §7.117 2026-10-30): every receive stream of
+  /// this store drops all frames (`unbound`) until [bindLeg] gives it the leg_index of its participant, and
+  /// afterwards opens only KIDs of that leg (`wrong-leg` otherwise; both count toward the storm, Q3). R1: when it
+  /// was requested and the binary does not honour it (AAR < tkm.9, the iOS framework before its S-7 rebuild: the
+  /// create answer lacks `requireLegBinding: true`), the store is disposed and [SframeUnavailableException] is
+  /// thrown — never a store that silently opens every KID. Only a caller that passes `false` (tests, vectors) gets
+  /// one without the binding.
   static Future<SframeKeyStore> create(
-      {int stormThreshold = 30, bool h264 = false, bool requireLegBinding = false}) async {
+      {int stormThreshold = 30, bool h264 = false, bool requireLegBinding = true}) async {
     final r = await _sframeCall<Map<dynamic, dynamic>>('sframeKeyStoreCreate', <String, dynamic>{
       'stormThreshold': stormThreshold,
       'h264': h264,
       'requireLegBinding': requireLegBinding,
     });
-    return SframeKeyStore._(r!['keyStoreId'] as String,
-        legBindingRequired: r['requireLegBinding'] as bool? ?? false);
+    final id = r!['keyStoreId'] as String;
+    final honoured = r['requireLegBinding'] as bool? ?? false;
+    if (requireLegBinding && !honoured) {
+      try {
+        await _sframeCall<void>('sframeKeyStoreDispose', <String, dynamic>{'keyStoreId': id});
+      } catch (_) {
+        // the store is useless either way; the exception below is what matters
+      }
+      throw SframeUnavailableException('sframeKeyStoreCreate',
+          'leg binding not in this binary (needs AAR >= 150.7871.03-tkm.9 / the S-7 iOS framework): fail closed');
+    }
+    return SframeKeyStore._(id, legBindingRequired: honoured);
   }
 
   Map<String, dynamic> _a([Map<String, dynamic>? more]) {
@@ -305,9 +322,15 @@ class SframeKeyStore {
     return id == null ? null : SframeTransformer._(id, this);
   }
 
-  /// The transformer attached to [receiver], or null (then its media must never be rendered).
+  /// The transformer attached to [receiver], or null (then its media must never be rendered — and, since Iris
+  /// §7.117 item 1, a caller should fail the call: an enabled remote audio track plays unrendered).
+  /// Prefers the cryptor id the onTrack event carried ([RTCRtpReceiverNative.sframeCryptorId]: the transformer
+  /// attached to THIS receiver inside onAddTrack, no lookup). Falls back to the lookup by receiver id, which the
+  /// plugin answers null for an id seen on two m-lines of the peer connection (ambiguous = refuse).
   Future<SframeTransformer?> transformerOfReceiver(RTCRtpReceiver receiver) async {
     final rc = receiver as RTCRtpReceiverNative;
+    final carried = rc.sframeCryptorId;
+    if (carried != null) return SframeTransformer._(carried, this, streamId: rc.sframeStreamId);
     final id = await _sframeCall<String>('sframeAttachedFor',
         <String, dynamic>{'peerConnectionId': rc.peerConnectionId, 'rtpReceiverId': rc.receiverId});
     return id == null ? null : SframeTransformer._(id, this);
@@ -345,20 +368,29 @@ class SframeKeyStore {
 
 /// The transformer attached to one sender or receiver.
 class SframeTransformer {
-  SframeTransformer._(this.id, this.store);
+  SframeTransformer._(this.id, this.store, {String? streamId}) : _streamId = streamId;
 
   /// A handle on an existing cryptor id, for tests of code that drives [stats] / [bindLeg] over a mocked channel.
   @visibleForTesting
-  SframeTransformer.forTesting(this.id, this.store);
+  SframeTransformer.forTesting(this.id, this.store, {String? streamId}) : _streamId = streamId;
 
   final String id;
   final SframeKeyStore store;
+  String? _streamId;
 
-  Future<SframeStreamStats> stats() async => SframeStreamStats.fromJson(
-      (await _sframeCall<String>('sframeCryptorGetStats', <String, dynamic>{'cryptorId': id}))!);
+  /// The stream label (`recv:<kind>:<uuid>` / `send:<kind>:<senderId>`) when known without a channel call: carried
+  /// by the onTrack event, or read by the last [stats]. Null until then.
+  String? get streamId => _streamId;
+
+  Future<SframeStreamStats> stats() async {
+    final s = SframeStreamStats.fromJson(
+        (await _sframeCall<String>('sframeCryptorGetStats', <String, dynamic>{'cryptorId': id}))!);
+    _streamId = s.streamId;
+    return s;
+  }
 
   /// S-7: [SframeKeyStore.bindLeg] for this transformer's stream (a receiver). Same results and exceptions.
-  Future<bool> bindLeg(int? legIndex) async => store.bindLeg((await stats()).streamId, legIndex);
+  Future<bool> bindLeg(int? legIndex) async => store.bindLeg(_streamId ?? (await stats()).streamId, legIndex);
 
   /// Engagement (spec §9.2 [0.2], per subscription): completes when this transformer has handed on
   /// [minPassed] more authenticated frames than at the call (the baseline), or throws on [timeout].

@@ -520,9 +520,26 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
   @Override
   public void onAddTrack(RtpReceiver receiver, MediaStream[] mediaStreams) {
     Log.d(TAG, "onAddTrack");
-    // C182: attach the SFrame opening transformer (auto-attach mode) before Dart hears of the track.
-    FlutterSFrame sframe = FlutterSFrame.instance;
-    if (sframe != null) sframe.onReceiverAdded(id, receiver);
+    // The receiver's transceiver (unified plan): the one onTrack just handed us (F-M2-2), else the list.
+    RtpTransceiver matched = null;
+    if (this.configuration.sdpSemantics == PeerConnection.SdpSemantics.UNIFIED_PLAN) {
+      RtpTransceiver fromOnTrack = lastOnTrackTransceiver;
+      lastOnTrackTransceiver = null;
+      List<RtpTransceiver> transceivers =
+          fromOnTrack != null && fromOnTrack.getReceiver() != null && receiver.id().equals(fromOnTrack.getReceiver().id())
+              ? java.util.Collections.singletonList(fromOnTrack)
+              : peerConnection.getTransceivers();
+      for (RtpTransceiver transceiver : transceivers) {
+        if (transceiver.getReceiver() != null && receiver.id().equals(transceiver.getReceiver().id())) {
+          matched = transceiver;
+          break;
+        }
+      }
+    }
+    // C182: attach the SFrame opening transformer (auto-attach mode) before Dart hears of the track — keyed by the
+    // transceiver's mid, never by the receiver id (Iris §7.117 1-B); its cryptor id rides on the onTrack event.
+    FlutterSFrame.Attachment sframe =
+        FlutterSFrame.onReceiverAdded(id, receiver, matched != null ? matched.getMid() : null);
     // for plan-b
     for (MediaStream stream : mediaStreams) {
       String streamId = stream.getId();
@@ -560,25 +577,20 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
     params.putString("event", "onTrack");
     params.putArray("streams", streams.toArrayList());
     params.putMap("track", mediaTrackToMap(receiver.track()));
-    params.putMap("receiver", rtpReceiverToMap(receiver));
+    Map<String, Object> receiverMap = rtpReceiverToMap(receiver);
+    if (sframe.cryptorId != null) { // Iris §7.117 1-B.4: Dart keeps it (RTCRtpReceiverNative.sframeCryptorId)
+      receiverMap.put("sframeCryptorId", sframe.cryptorId);
+      receiverMap.put("sframeStreamId", sframe.streamId);
+    }
+    params.putMap("receiver", receiverMap);
 
-    if (this.configuration.sdpSemantics == PeerConnection.SdpSemantics.UNIFIED_PLAN) {
-      RtpTransceiver fromOnTrack = lastOnTrackTransceiver;
-      lastOnTrackTransceiver = null;
-      List<RtpTransceiver> transceivers =
-          fromOnTrack != null && fromOnTrack.getReceiver() != null && receiver.id().equals(fromOnTrack.getReceiver().id())
-              ? java.util.Collections.singletonList(fromOnTrack)
-              : peerConnection.getTransceivers();
-      for (RtpTransceiver transceiver : transceivers) {
-        if (transceiver.getReceiver() != null && receiver.id().equals(transceiver.getReceiver().id())) {
-          String transceiverId = transceiver.getMid();
-          if (null == transceiverId) {
-            transceiverId = stateProvider.getNextStreamUUID();
-            this.transceivers.put(transceiverId,transceiver);
-          }
-          params.putMap("transceiver", transceiverToMap(transceiverId, transceiver));
-        }
+    if (matched != null) {
+      String transceiverId = matched.getMid();
+      if (null == transceiverId) {
+        transceiverId = stateProvider.getNextStreamUUID();
+        this.transceivers.put(transceiverId, matched);
       }
+      params.putMap("transceiver", transceiverToMap(transceiverId, matched));
     }
     sendEvent(params);
   }
@@ -1058,8 +1070,7 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
 
   // C182: attach the SFrame sealing transformer (auto-attach mode) inside the call that created the sender.
   private void sframeOnSender(RtpSender sender, String kind) {
-    FlutterSFrame sframe = FlutterSFrame.instance;
-    if (sframe != null) sframe.onSenderCreated(id, sender, kind);
+    FlutterSFrame.onSenderCreated(id, sender, kind); // process-wide registry (Iris §7.117 item 3)
   }
 
   public void addTrack(MediaStreamTrack track, List<String> streamIds, Result result) {

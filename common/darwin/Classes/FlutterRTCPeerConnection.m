@@ -38,6 +38,15 @@
                            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+- (RTCRtpTransceiver*)lastOnTrackTransceiver {
+  return objc_getAssociatedObject(self, _cmd);
+}
+
+- (void)setLastOnTrackTransceiver:(RTCRtpTransceiver*)transceiver {
+  objc_setAssociatedObject(self, @selector(lastOnTrackTransceiver), transceiver,
+                           OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 - (BOOL)closedByPlugin {
   return [objc_getAssociatedObject(self, _cmd) boolValue];
 }
@@ -625,14 +634,36 @@
 
 - (void)peerConnection:(RTCPeerConnection*)peerConnection
     didStartReceivingOnTransceiver:(RTCRtpTransceiver*)transceiver {
+  peerConnection.lastOnTrackTransceiver = transceiver;  // C182: consumed by didAddReceiver below
 }
 
 /** Called when a receiver and its track are created. */
 - (void)peerConnection:(RTCPeerConnection*)peerConnection
         didAddReceiver:(RTCRtpReceiver*)rtpReceiver
                streams:(NSArray<RTCMediaStream*>*)mediaStreams {
-  // C182: attach the SFrame opening transformer (auto-attach mode) before Dart hears of the track.
-  [self sframeOnReceiverAdded:rtpReceiver peerConnectionId:peerConnection.flutterId];
+  // The receiver's transceiver (unified plan): the one didStartReceivingOnTransceiver just handed us, else the list.
+  RTCRtpTransceiver* matched = nil;
+  if (peerConnection.configuration.sdpSemantics == RTCSdpSemanticsUnifiedPlan) {
+    RTCRtpTransceiver* fromOnTrack = peerConnection.lastOnTrackTransceiver;
+    peerConnection.lastOnTrackTransceiver = nil;
+    NSArray<RTCRtpTransceiver*>* candidates =
+        (fromOnTrack != nil && fromOnTrack.receiver != nil &&
+         [fromOnTrack.receiver.receiverId isEqualToString:rtpReceiver.receiverId])
+            ? @[ fromOnTrack ]
+            : peerConnection.transceivers;
+    for (RTCRtpTransceiver* transceiver in candidates) {
+      if (transceiver.receiver != nil &&
+          [transceiver.receiver.receiverId isEqualToString:rtpReceiver.receiverId]) {
+        matched = transceiver;
+        break;
+      }
+    }
+  }
+  // C182: attach the SFrame opening transformer (auto-attach mode) before Dart hears of the track — keyed by the
+  // transceiver's mid, never by the receiver id (Iris §7.117 1-B); its cryptor id rides on the onTrack event.
+  NSDictionary* sframe = [self sframeOnReceiverAdded:rtpReceiver
+                                     peerConnectionId:peerConnection.flutterId
+                                                  mid:matched.mid];
   // For unified-plan
   NSMutableArray* streams = [NSMutableArray array];
   for (RTCMediaStream* stream in mediaStreams) {
@@ -640,21 +671,18 @@
   }
   FlutterEventSink eventSink = peerConnection.eventSink;
   if (eventSink) {
+    NSMutableDictionary* receiverMap = [[self receiverToMap:rtpReceiver] mutableCopy];
+    if (sframe != nil) [receiverMap addEntriesFromDictionary:sframe];  // sframeCryptorId / sframeStreamId (1-B.4)
     NSMutableDictionary* event = [NSMutableDictionary dictionary];
     [event addEntriesFromDictionary:@{
       @"event" : @"onTrack",
       @"track" : [self mediaTrackToMap:rtpReceiver.track],
-      @"receiver" : [self receiverToMap:rtpReceiver],
+      @"receiver" : receiverMap,
       @"streams" : streams,
     }];
 
-    if (peerConnection.configuration.sdpSemantics == RTCSdpSemanticsUnifiedPlan) {
-      for (RTCRtpTransceiver* transceiver in peerConnection.transceivers) {
-        if (transceiver.receiver != nil &&
-            [transceiver.receiver.receiverId isEqualToString:rtpReceiver.receiverId]) {
-          [event setValue:[self transceiverToMap:transceiver] forKey:@"transceiver"];
-        }
-      }
+    if (matched != nil) {
+      [event setValue:[self transceiverToMap:matched] forKey:@"transceiver"];
     }
 
     peerConnection.remoteTracks[rtpReceiver.track.trackId] = rtpReceiver.track;
